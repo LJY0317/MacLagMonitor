@@ -1,0 +1,17 @@
+# Public repository allowlist.
+# Everything is private/local by default. Add a path below only after review.
+/*
+
+!/.gitignore
+!/README.md
+!/CHANGELOG.md
+!/VERSION
+!/config.example.conf
+!/install.command
+!/uninstall.command
+!/bin/
+
+/bin/*
+!/bin/mac-lag-monitor.sh
+!/bin/mac-lag-monitorctl.sh
+!/bin/check-public-tree.sh
