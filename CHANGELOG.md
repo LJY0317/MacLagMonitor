@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.1 — 2026-09-04
+
+- 인터넷 장애가 감지된 순간에만 기본 게이트웨이와 외부 숫자 IP를 짧게 확인하는 경로 진단을 추가했습니다.
+- 상시 ping 없이 장애 시점의 시스템 load와 네트워크 경로를 함께 기록해 호스트 포화와 로컬/WAN/DNS 문제를 구분하기 쉽게 했습니다.
+- incident 진단에 시스템 load 기여도와 `probable-host-saturation-affecting-network` 분류를 추가했습니다.
+
+## 1.7.0 — 2026-09-03
+
+- 사고 시 hot WebKit PID와 Safari hostname을 직접 대조하는 선택 기능을 추가했습니다.
+- URL/페이지 제목 원문은 저장하지 않고 hostname과 WebProcess PID만 추출합니다.
+- 평상시 Safari polling 없이 기존 incident 자료를 재사용하며, README에 선택적 설정·복구 방법을 추가했습니다.
+
 ## 1.6.3 — 2026-09-03
 
 - 기존 소스 폴더가 실행 설치본이던 경우 `config/data/logs/state`를 기본 설치 위치로 자동 이전하도록 installer를 보강했습니다.
