@@ -100,6 +100,15 @@ DOMAIN_CORRELATION_TOP_HOT_COUNT=0
 DOMAIN_CORRELATION_TOP_ACTIVE_COUNT=0
 DOMAIN_CORRELATION_INCIDENTS_WITH_DOMAINS=0
 DOMAIN_CORRELATION_STRENGTH="none"
+PID_DOMAIN_MATCH_FOUND=0
+PID_DOMAIN_MATCH_PID=""
+PID_DOMAIN_MATCH_DOMAIN=""
+PID_DOMAIN_MATCH_EVIDENCE=""
+PID_DOMAIN_MATCH_ACTIVE=0
+PID_DOMAIN_MATCH_STRENGTH="none"
+NETWORK_PATH_CLASSIFICATION="not-captured"
+NETWORK_PATH_GATEWAY_STATUS="unknown"
+NETWORK_PATH_EXTERNAL_STATUS="unknown"
 LOGICAL_CPU_COUNT="$(sysctl -n hw.logicalcpu_max 2>/dev/null || print 8)"
 [[ "$LOGICAL_CPU_COUNT" == <-> ]] || LOGICAL_CPU_COUNT=8
 
@@ -397,6 +406,85 @@ collect_internet_metrics() {
   record_internet_transition "$INTERNET_STATE" "$details"
 }
 
+capture_outage_path_diagnostics() {
+  local incident_dir="$1" output="$incident_dir/network-path-probe.txt"
+  local route_text gateway interface gateway_output external_output
+  local gateway_exit=99 external_exit=99 load1 load_per_cpu load_high=0
+  local classification="unresolved" interpretation=""
+
+  NETWORK_PATH_CLASSIFICATION="unresolved"
+  NETWORK_PATH_GATEWAY_STATUS="unknown"
+  NETWORK_PATH_EXTERNAL_STATUS="unknown"
+  route_text="$(route -n get default 2>&1)"
+  gateway="$(print -r -- "$route_text" | awk '/gateway:/{print $2; exit}')"
+  interface="$(print -r -- "$route_text" | awk '/interface:/{print $2; exit}')"
+  load1="${LOAD_1M:-0}"
+  load_per_cpu="$(awk -v load="$load1" -v cpus="$LOGICAL_CPU_COUNT" 'BEGIN {if (cpus > 0) printf "%.2f", load / cpus; else print "0.00"}')"
+  (( $(integer_value "$load1") >= LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD )) && load_high=1
+
+  if [[ -n "$gateway" ]]; then
+    gateway_output="$(/sbin/ping -n -q -c 3 -W 1000 "$gateway" 2>&1)"
+    gateway_exit=$?
+  else
+    gateway_output="default gateway unavailable"
+  fi
+  external_output="$(/sbin/ping -n -q -c 3 -W 1000 1.1.1.1 2>&1)"
+  external_exit=$?
+
+  (( gateway_exit == 0 )) && NETWORK_PATH_GATEWAY_STATUS="reachable" || NETWORK_PATH_GATEWAY_STATUS="unreachable"
+  (( external_exit == 0 )) && NETWORK_PATH_EXTERNAL_STATUS="reachable" || NETWORK_PATH_EXTERNAL_STATUS="unreachable"
+
+  if [[ -z "$gateway" ]]; then
+    classification="local-route-missing"
+    interpretation="기본 게이트웨이를 찾지 못해 로컬 네트워크 경로 문제 가능성이 큼"
+  elif (( gateway_exit != 0 )); then
+    classification="local-link-or-router-unreachable"
+    interpretation="기본 게이트웨이 응답이 없어 Wi-Fi/로컬 링크/공유기 구간을 우선 확인"
+  elif (( external_exit != 0 )); then
+    classification="upstream-path-or-icmp-filtering"
+    interpretation="공유기는 응답하지만 외부 숫자 IP는 응답하지 않음. WAN/상위 경로 문제 가능성이 있으나 ICMP 차단 가능성도 있음"
+  elif [[ "${DNS_STATE:-unknown}" == "failed" ]]; then
+    classification="dns-resolution-failure"
+    interpretation="공유기와 외부 숫자 IP는 도달 가능하지만 DNS가 실패해 이름 해석 경로를 우선 확인"
+  elif (( load_high == 1 )); then
+    classification="host-saturation-or-transport-contention"
+    interpretation="공유기와 외부 숫자 IP는 응답하지만 HTTPS 검사 실패와 높은 시스템 load가 겹침. 호스트 포화로 TCP/TLS 작업이 지연됐을 가능성이 큼"
+  else
+    classification="https-or-transport-specific-failure"
+    interpretation="ICMP 경로는 살아 있으나 HTTPS 검사가 실패해 TCP/TLS/필터/원격 서비스 경로를 추가 확인"
+  fi
+  NETWORK_PATH_CLASSIFICATION="$classification"
+
+  {
+    print -r -- "captured=$(timestamp)"
+    print -r -- "path_classification=$classification"
+    print -r -- "interpretation=$interpretation"
+    print -r -- "internet_state_at_trigger=${INTERNET_STATE:-unknown}"
+    print -r -- "dns_state_at_trigger=${DNS_STATE:-unknown}"
+    print -r -- "internet_probe_codes_at_trigger=${INTERNET_PROBE_CODES:-unknown}"
+    print -r -- "load_1m_at_trigger=$load1"
+    print -r -- "logical_cpu_count=$LOGICAL_CPU_COUNT"
+    print -r -- "load_per_logical_cpu=$load_per_cpu"
+    print -r -- "system_load_high=$load_high"
+    print -r -- "default_gateway=${gateway:-unknown}"
+    print -r -- "default_interface=${interface:-unknown}"
+    print -r -- "gateway_ping_status=$NETWORK_PATH_GATEWAY_STATUS"
+    print -r -- "external_numeric_target=1.1.1.1"
+    print -r -- "external_ping_status=$NETWORK_PATH_EXTERNAL_STATUS"
+    print -r -- ""
+    print -r -- "--- default route ---"
+    print -r -- "$route_text"
+    print -r -- "--- gateway ping ---"
+    print -r -- "$gateway_output"
+    print -r -- "--- external numeric ping ---"
+    print -r -- "$external_output"
+    if [[ -n "$interface" ]]; then
+      print -r -- "--- interface counters ---"
+      /usr/sbin/netstat -I "$interface" -b -d -n 2>&1 | head -n 4
+    fi
+  } >| "$output"
+}
+
 collect_vm_metrics() {
   local vm pressure swap_line
   vm="$(vm_stat 2>/dev/null)"
@@ -595,28 +683,31 @@ capture_safari_domains() {
     return
   fi
 
-  osascript -l JavaScript 2>/dev/null <<'JXA' | awk -F '\t' '
-    function domain(url, x) {
-      x=url
-      sub(/^[A-Za-z]+:\/\//,"",x)
-      sub(/[\/?#].*$/,"",x)
-      return tolower(x)
-    }
-    NF >= 4 {
-      d=domain($4)
-      if (d != "") printf "window=%s\ttab=%s\tactive=%s\tdomain=%s\n", $1, $2, $3, d
-    }
-  ' >| "$output"
+  osascript -l JavaScript 2>/dev/null <<'JXA' >| "$output"
 const safari = Application('Safari');
 const lines = [];
+function hostname(rawURL) {
+  try {
+    return new URL(rawURL).hostname.toLowerCase();
+  } catch (e) {
+    const match = String(rawURL || '').match(/^[A-Za-z]+:\/\/([^\/?#]+)/);
+    return match ? match[1].toLowerCase() : '';
+  }
+}
 try {
   safari.windows().forEach((w, wi) => {
     let activeURL = '';
     try { activeURL = w.currentTab().url() || ''; } catch (e) {}
     w.tabs().forEach((t, ti) => {
       let url = '';
+      let title = '';
+      let webProcessPID = '-';
       try { url = t.url() || ''; } catch (e) {}
-      if (url) lines.push(`${wi + 1}\t${ti + 1}\t${url === activeURL ? 1 : 0}\t${url}`);
+      try { title = t.name() || ''; } catch (e) {}
+      const domain = hostname(url);
+      const match = title.match(/\[WP\s+([0-9]+)\]/);
+      if (match) webProcessPID = match[1];
+      if (domain) lines.push(`window=${wi + 1}\ttab=${ti + 1}\tactive=${url === activeURL ? 1 : 0}\tdomain=${domain}\twebprocess_pid=${webProcessPID}`);
     });
   });
 } catch (e) {}
@@ -772,6 +863,166 @@ generate_cross_incident_domain_correlation() {
     fi
     print -r -- ""
     print -r -- "limits=반복 등장은 연관 후보일 뿐 원인 증명이 아님. 오래 열어 둔 공통 탭도 반복될 수 있으므로 macOS resource report·PID·종료 후 회복 증거와 함께 해석해야 함"
+  } >| "$output"
+}
+
+generate_webkit_pid_domain_correlation() {
+  local incident_dir="$1" output="$incident_dir/pid-domain-correlation.txt"
+  local file line pid domain active evidence key count active_count score top_score=-1
+  local source_line target_pid target_evidence_value tab=$'\t'
+  local -a domain_files candidates sorted_candidates target_rows
+  typeset -A target_evidence match_counts active_counts
+
+  PID_DOMAIN_MATCH_FOUND=0
+  PID_DOMAIN_MATCH_PID=""
+  PID_DOMAIN_MATCH_DOMAIN=""
+  PID_DOMAIN_MATCH_EVIDENCE=""
+  PID_DOMAIN_MATCH_ACTIVE=0
+  PID_DOMAIN_MATCH_STRENGTH="none"
+
+  if (( CAPTURE_SAFARI_DOMAINS != 1 )); then
+    print -r -- "disabled-by-privacy-setting" >| "$output"
+    return
+  fi
+
+  if [[ -f "$incident_dir/metadata.txt" ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        trigger_webkit_max_pid=*)
+          pid="${line#*=}"
+          [[ "$pid" == <-> && "$pid" -gt 0 ]] || continue
+          target_evidence[$pid]="trigger-max-memory"
+          ;;
+        trigger_webkit_hot_pid=*)
+          pid="${line#*=}"
+          [[ "$pid" == <-> && "$pid" -gt 0 ]] || continue
+          if [[ "${target_evidence[$pid]:-}" != *"trigger-hot-cpu"* ]]; then
+            target_evidence[$pid]="${target_evidence[$pid]:+${target_evidence[$pid]},}trigger-hot-cpu"
+          fi
+          ;;
+      esac
+    done < "$incident_dir/metadata.txt"
+  fi
+
+  if [[ -f "$incident_dir/webkit-hot-samples.txt" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == webkit_pid=* ]] || continue
+      pid="${line#*=}"
+      [[ "$pid" == <-> && "$pid" -gt 0 ]] || continue
+      if [[ "${target_evidence[$pid]:-}" != *"hot-sample"* ]]; then
+        target_evidence[$pid]="${target_evidence[$pid]:+${target_evidence[$pid]},}hot-sample"
+      fi
+    done < "$incident_dir/webkit-hot-samples.txt"
+  fi
+
+  if [[ -f "$incident_dir/timeline.tsv" ]]; then
+    while IFS=$'\t' read -r pid evidence; do
+      [[ "$pid" == <-> && "$pid" -gt 0 && -n "$evidence" ]] || continue
+      if [[ "${target_evidence[$pid]:-}" != *"$evidence"* ]]; then
+        target_evidence[$pid]="${target_evidence[$pid]:+${target_evidence[$pid]},}$evidence"
+      fi
+    done < <(awk -F '\t' -v mem="$INCIDENT_WEBKIT_PROCESS_MB_THRESHOLD" -v cpu="$WEBKIT_CPU_SAMPLE_THRESHOLD" '
+      NR > 1 {
+        if (($12+0) >= mem && ($13+0) > 0) print ($13+0) "\ttimeline-high-memory"
+        if (($31+0) >= cpu && ($32+0) > 0) print ($32+0) "\ttimeline-hot-cpu"
+      }
+    ' "$incident_dir/timeline.tsv" 2>/dev/null | sort -u)
+  fi
+
+  if (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )) && [[ "$MACOS_RESOURCE_PID" == <-> ]] && (( MACOS_RESOURCE_PID > 0 )); then
+    pid="$MACOS_RESOURCE_PID"
+    if [[ "${target_evidence[$pid]:-}" != *"macos-resource"* ]]; then
+      target_evidence[$pid]="${target_evidence[$pid]:+${target_evidence[$pid]},}macos-resource"
+    fi
+  fi
+
+  if [[ "${WEBKIT_MAX_PID:-0}" == <-> ]] && (( WEBKIT_MAX_PID > 0 )); then
+    pid="$WEBKIT_MAX_PID"
+    if [[ "${target_evidence[$pid]:-}" != *"end-max-memory"* ]]; then
+      target_evidence[$pid]="${target_evidence[$pid]:+${target_evidence[$pid]},}end-max-memory"
+    fi
+  fi
+  if [[ "${WEBKIT_HOT_PID:-0}" == <-> ]] && (( WEBKIT_HOT_PID > 0 )); then
+    pid="$WEBKIT_HOT_PID"
+    if [[ "${target_evidence[$pid]:-}" != *"end-hot-cpu"* ]]; then
+      target_evidence[$pid]="${target_evidence[$pid]:+${target_evidence[$pid]},}end-hot-cpu"
+    fi
+  fi
+
+  domain_files=("$incident_dir"/*-safari-domains.txt(N.))
+  for file in "${domain_files[@]}"; do
+    [[ -f "$file" ]] || continue
+    while IFS= read -r line; do
+      [[ "$line" == *$'\t'webprocess_pid=* ]] || continue
+      pid="${line##*webprocess_pid=}"
+      [[ "$pid" == <-> ]] || continue
+      evidence="${target_evidence[$pid]:-}"
+      [[ -n "$evidence" ]] || continue
+      domain="${line##*domain=}"
+      domain="${domain%%$'\t'*}"
+      [[ -n "$domain" ]] || continue
+      active="${line##*active=}"
+      active="${active%%$'\t'*}"
+      [[ "$active" == "1" ]] || active=0
+      key="${pid}${tab}${domain}"
+      match_counts[$key]=$(( ${match_counts[$key]:-0} + 1 ))
+      active_counts[$key]=$(( ${active_counts[$key]:-0} + active ))
+    done < "$file"
+  done
+
+  for key in ${(k)match_counts}; do
+    pid="${key%%$'\t'*}"
+    domain="${key#*$'\t'}"
+    count=${match_counts[$key]:-0}
+    active_count=${active_counts[$key]:-0}
+    evidence="${target_evidence[$pid]:-unknown}"
+    score=$(( count * 10 + active_count * 3 ))
+    [[ "$evidence" == *"hot-sample"* ]] && score=$(( score + 20 ))
+    [[ "$evidence" == *"macos-resource"* ]] && score=$(( score + 30 ))
+    candidates+=("${score}${tab}${count}${tab}${active_count}${tab}${pid}${tab}${evidence}${tab}${domain}")
+    if (( score > top_score )); then
+      top_score=$score
+      PID_DOMAIN_MATCH_FOUND=1
+      PID_DOMAIN_MATCH_PID="$pid"
+      PID_DOMAIN_MATCH_DOMAIN="$domain"
+      PID_DOMAIN_MATCH_EVIDENCE="$evidence"
+      PID_DOMAIN_MATCH_ACTIVE=$active_count
+    fi
+  done
+
+  if (( PID_DOMAIN_MATCH_FOUND == 1 )); then
+    if [[ "$PID_DOMAIN_MATCH_EVIDENCE" == *"macos-resource"* || "$PID_DOMAIN_MATCH_EVIDENCE" == *"hot-sample"* ]]; then
+      PID_DOMAIN_MATCH_STRENGTH="high"
+    else
+      PID_DOMAIN_MATCH_STRENGTH="medium-high"
+    fi
+  fi
+
+  {
+    print -r -- "MacLagMonitor WebKit PID to Safari domain correlation"
+    print -r -- "generated=$(timestamp)"
+    print -r -- "target_pid_count=${#target_evidence}"
+    print -r -- "direct_pid_domain_match_found=$PID_DOMAIN_MATCH_FOUND"
+    if (( PID_DOMAIN_MATCH_FOUND == 1 )); then
+      print -r -- "top_matched_pid=$PID_DOMAIN_MATCH_PID"
+      print -r -- "top_matched_domain=$PID_DOMAIN_MATCH_DOMAIN"
+      print -r -- "top_match_evidence=$PID_DOMAIN_MATCH_EVIDENCE"
+      print -r -- "top_match_active_capture_count=$PID_DOMAIN_MATCH_ACTIVE"
+      print -r -- "top_match_mapping_strength=$PID_DOMAIN_MATCH_STRENGTH"
+    fi
+    print -r -- ""
+    print -r -- "matches:"
+    if (( ${#candidates} == 0 )); then
+      print -r -- "none"
+    else
+      sorted_candidates=("${(@f)$(printf '%s\n' "${candidates[@]}" | sort -t $'\t' -k1,1nr -k2,2nr -k3,3nr | head -n 10)}")
+      for source_line in "${sorted_candidates[@]}"; do
+        IFS=$'\t' read -r score count active_count target_pid target_evidence_value domain <<< "$source_line"
+        print -r -- "pid=$target_pid domain=$domain evidence=$target_evidence_value capture_rows=$count active_capture_rows=$active_count"
+      done
+    fi
+    print -r -- ""
+    print -r -- "limits=PID가 같은 Safari 탭/도메인과의 직접 매핑은 강한 연관 증거지만 Site Isolation의 iframe·subframe·worker 때문에 해당 top-level 도메인이 CPU/메모리 원인임을 단독으로 증명하지 않음"
   } >| "$output"
 }
 
@@ -1221,9 +1472,10 @@ capture_content_filter_context() {
 
 generate_incident_diagnosis() {
   local incident_dir="$1" reason="$2" timeline output metrics
-  local min_free max_compressor max_swap max_safari max_webkit max_ws max_report max_symbol max_content_filter max_webkit_count offline_seen
+  local min_free max_compressor max_swap max_load max_safari max_webkit max_ws max_report max_symbol max_content_filter max_webkit_count offline_seen
   local max_webkit_hot hot_pid max_mediaanalysis max_mobileasset max_replay factor_count=0 primary="unresolved"
-  local webkit_factor=0 background_factor=0 memory_factor=0 display_factor=0 network_factor=0 classification
+  local webkit_factor=0 background_factor=0 memory_factor=0 display_factor=0 network_factor=0 load_factor=0 classification
+  local network_path_classification="not-captured"
   timeline="$incident_dir/timeline.tsv"
   output="$incident_dir/diagnosis.txt"
   metrics="$(awk -F '\t' '
@@ -1232,6 +1484,7 @@ generate_incident_diagnosis() {
       if (($4+0) < minfree) minfree=$4+0
       if (($6+0) > comp) comp=$6+0
       if (($8+0) > swap) swap=$8+0
+      if (($9+0) > load) load=$9+0
       if (($10+0) > safari) safari=$10+0
       if (($11+0) > webkit) webkit=$11+0
       if (($14+0) > ws) ws=$14+0
@@ -1245,9 +1498,13 @@ generate_incident_diagnosis() {
       if (($36+0) > replay) replay=$36+0
       if ($19 != "online" && $19 != "disabled") offline=1
     }
-    END {printf "%.0f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.0f %d %.1f %d %.1f %.1f %.1f\n", minfree,comp,swap,safari,webkit,ws,report,symbol,content_filter,wc,offline,webkit_hot,hot_pid,mediaanalysis,mobileasset,replay}
+    END {printf "%.0f %.1f %.1f %.2f %.1f %.1f %.1f %.1f %.1f %.1f %.0f %d %.1f %d %.1f %.1f %.1f\n", minfree,comp,swap,load,safari,webkit,ws,report,symbol,content_filter,wc,offline,webkit_hot,hot_pid,mediaanalysis,mobileasset,replay}
   ' "$timeline" 2>/dev/null)"
-  read -r min_free max_compressor max_swap max_safari max_webkit max_ws max_report max_symbol max_content_filter max_webkit_count offline_seen max_webkit_hot hot_pid max_mediaanalysis max_mobileasset max_replay <<< "${metrics:-101 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0}"
+  read -r min_free max_compressor max_swap max_load max_safari max_webkit max_ws max_report max_symbol max_content_filter max_webkit_count offline_seen max_webkit_hot hot_pid max_mediaanalysis max_mobileasset max_replay <<< "${metrics:-101 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0}"
+  if [[ -f "$incident_dir/network-path-probe.txt" ]]; then
+    network_path_classification="$(awk -F= '$1 == "path_classification" {print substr($0, index($0, "=") + 1); exit}' "$incident_dir/network-path-probe.txt" 2>/dev/null)"
+    [[ -n "$network_path_classification" ]] || network_path_classification="unresolved"
+  fi
 
   if (( $(integer_value "$max_webkit_hot") >= WEBKIT_CPU_SAMPLE_THRESHOLD || $(integer_value "$max_safari") >= SAFARI_GROUP_MB_THRESHOLD )); then
     webkit_factor=1
@@ -1269,12 +1526,20 @@ generate_incident_diagnosis() {
     (( factor_count++ ))
     [[ "$primary" == "unresolved" ]] && primary="windowserver-display-load"
   fi
+  if (( $(integer_value "$max_load") >= LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD )); then
+    load_factor=1
+    (( factor_count++ ))
+    [[ "$primary" == "unresolved" ]] && primary="host-system-load-saturation"
+  fi
   if (( offline_seen == 1 )); then
     network_factor=1
     (( factor_count++ ))
     [[ "$primary" == "unresolved" ]] && primary="general-network-or-dns-problem"
   fi
-  if (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
+  if [[ ",$reason," == *",internet-down,"* && "$network_path_classification" == "host-saturation-or-transport-contention" ]] && (( load_factor == 1 && network_factor == 1 )); then
+    primary="probable-host-saturation-affecting-network"
+    classification="probable-host-saturation-affecting-network"
+  elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
     primary="probable-webkit-content-runaway"
     classification="probable-webkit-content-runaway"
   elif (( factor_count >= 2 )); then
@@ -1290,14 +1555,25 @@ generate_incident_diagnosis() {
     print -r -- ""
     print -r -- "classification=$classification"
     print -r -- "primary_suspect=$primary"
-    if (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
+    if [[ "$classification" == "probable-host-saturation-affecting-network" ]]; then
+      print -r -- "confidence=medium-high"
+    elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
       print -r -- "confidence=high"
     elif (( MACOS_RESOURCE_FOUND == 1 )); then
       print -r -- "confidence=medium-high"
     else
       print -r -- "confidence=$([[ "$primary" == "unresolved" ]] && print low || print medium)"
     fi
-    print -r -- "contributors=safari_webkit:${webkit_factor},macos_background:${background_factor},memory:${memory_factor},windowserver:${display_factor},network:${network_factor}"
+    print -r -- "contributors=safari_webkit:${webkit_factor},macos_background:${background_factor},memory:${memory_factor},windowserver:${display_factor},system_load:${load_factor},network:${network_factor}"
+    print -r -- "network_path_classification=$network_path_classification"
+    print -r -- "direct_pid_domain_match_found=$PID_DOMAIN_MATCH_FOUND"
+    if (( PID_DOMAIN_MATCH_FOUND == 1 )); then
+      print -r -- "direct_pid_domain_pid=$PID_DOMAIN_MATCH_PID"
+      print -r -- "direct_pid_domain=$PID_DOMAIN_MATCH_DOMAIN"
+      print -r -- "direct_pid_domain_evidence=$PID_DOMAIN_MATCH_EVIDENCE"
+      print -r -- "direct_pid_domain_active_capture_count=$PID_DOMAIN_MATCH_ACTIVE"
+      print -r -- "direct_pid_domain_mapping_strength=$PID_DOMAIN_MATCH_STRENGTH"
+    fi
     print -r -- "cross_incident_domain_candidate_found=$DOMAIN_CORRELATION_FOUND"
     if (( DOMAIN_CORRELATION_FOUND == 1 )); then
       print -r -- "cross_incident_domain_candidate=$DOMAIN_CORRELATION_TOP_DOMAIN"
@@ -1316,7 +1592,13 @@ generate_incident_diagnosis() {
       print -r -- "macos_resource_footprint=$MACOS_RESOURCE_FOOTPRINT"
       print -r -- "macos_resource_stack_hint=$MACOS_RESOURCE_STACK_HINT"
     fi
-    if (( MACOS_WEBKIT_RESOURCE_FOUND == 1 && DOMAIN_CORRELATION_FOUND == 1 )); then
+    if [[ "$classification" == "probable-host-saturation-affecting-network" ]]; then
+      print -r -- "recommended_action=공유기와 외부 숫자 IP가 응답하는 동안 HTTPS 실패와 높은 시스템 load가 겹침. top CPU 프로세스 수를 줄이거나 동시 작업 수를 낮춘 뒤 같은 네트워크에서 재현 여부를 비교"
+    elif (( PID_DOMAIN_MATCH_FOUND == 1 && MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
+      print -r -- "recommended_action=macOS WebKit resource PID $PID_DOMAIN_MATCH_PID가 사고 시 Safari 도메인 '$PID_DOMAIN_MATCH_DOMAIN'과 직접 매핑됨. 이 도메인 탭부터 격리해 재현 여부를 확인하되 iframe·worker Site Isolation 가능성 때문에 단독 인과 증거로 보지는 말 것"
+    elif (( PID_DOMAIN_MATCH_FOUND == 1 )); then
+      print -r -- "recommended_action=사고 시 WebKit PID $PID_DOMAIN_MATCH_PID가 Safari 도메인 '$PID_DOMAIN_MATCH_DOMAIN'과 직접 매핑됨. 해당 탭을 우선 격리해 재현 여부를 비교하되 top-level 도메인과 실제 하위 WebProcess 원인이 다를 수 있음"
+    elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 && DOMAIN_CORRELATION_FOUND == 1 )); then
       print -r -- "recommended_action=macOS 자체가 WebKit CPU 과다를 기록했고 최근 WebKit 관련 사고에서 '$DOMAIN_CORRELATION_TOP_DOMAIN'이 ${DOMAIN_CORRELATION_TOP_COUNT}/${DOMAIN_CORRELATION_INCIDENTS_WITH_DOMAINS}회 반복됨. 이 도메인 탭부터 격리해 재현 여부를 확인하고, 재발하면 확장·콘텐츠 필터를 하나씩 꺼 비교"
     elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
       print -r -- "recommended_action=macOS 자체가 WebKit CPU 과다를 기록함. Safari를 완전 종료 후 재시작하고, 재발 시 사고 시점 도메인 후보에서 탭을 하나씩 격리한 뒤 확장·콘텐츠 필터를 하나씩 꺼 비교"
@@ -1328,7 +1610,7 @@ generate_incident_diagnosis() {
     elif (( background_factor == 1 )); then
       print -r -- "recommended_action=mediaanalysisd·mobileassetd·replayd 중 임계값을 넘은 프로세스와 recent-system-events.log의 작업 종류를 확인"
     elif (( network_factor == 1 )); then
-      print -r -- "recommended_action=network-events.tsv와 DNS/라우터/Wi-Fi 상태를 먼저 확인"
+      print -r -- "recommended_action=network-path-probe.txt와 network-events.tsv를 함께 보고 공유기/WAN/DNS/호스트 포화 중 어느 구간이 실패했는지 확인"
     elif (( display_factor == 1 )); then
       print -r -- "recommended_action=외부 디스플레이·미러링·주사율 조건을 바꿔 재현 비교"
     else
@@ -1338,6 +1620,9 @@ generate_incident_diagnosis() {
     print -r -- "observed_min_memory_free_pct=$min_free"
     print -r -- "observed_max_compressor_mb=$max_compressor"
     print -r -- "observed_max_swap_mb=$max_swap"
+    print -r -- "observed_max_load_1m=$max_load"
+    print -r -- "logical_cpu_count=$LOGICAL_CPU_COUNT"
+    print -r -- "system_load_trigger_threshold=$(( LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD ))"
     print -r -- "observed_max_safari_group_mb=$max_safari"
     print -r -- "observed_max_webkit_total_mb=$max_webkit"
     print -r -- "observed_max_webkit_process_count=$max_webkit_count"
@@ -1514,11 +1799,20 @@ run_incident_capture() {
     print -r -- "incident_interval_seconds=$INCIDENT_INTERVAL_SECONDS"
     print -r -- "incident_duration_seconds=$INCIDENT_DURATION_SECONDS"
     print -r -- "privacy_safari_domains=$CAPTURE_SAFARI_DOMAINS"
+    print -r -- "trigger_webkit_max_pid=${WEBKIT_MAX_PID:-0}"
+    print -r -- "trigger_webkit_hot_pid=${WEBKIT_HOT_PID:-0}"
     print -r -- "external_internet_checks=$INTERNET_CHECK_ENABLED"
   } >| "$CURRENT_INCIDENT_DIR/metadata.txt"
 
   log_message "incident-start id=$incident_id reason=$reason"
   send_local_notification
+  if [[ ",$reason," == *",internet-down,"* ]]; then
+    capture_outage_path_diagnostics "$CURRENT_INCIDENT_DIR"
+  else
+    NETWORK_PATH_CLASSIFICATION="not-captured"
+    NETWORK_PATH_GATEWAY_STATUS="unknown"
+    NETWORK_PATH_EXTERNAL_STATUS="unknown"
+  fi
   capture_detailed_state "$CURRENT_INCIDENT_DIR" "start"
 
   while (( $(epoch_now) < end )) && (( STOP_REQUESTED == 0 )); do
@@ -1544,6 +1838,7 @@ run_incident_capture() {
   capture_safari_fault_reports "$CURRENT_INCIDENT_DIR"
   capture_macos_resource_reports "$CURRENT_INCIDENT_DIR" "$start" "$(epoch_now)"
   capture_content_filter_context "$CURRENT_INCIDENT_DIR"
+  generate_webkit_pid_domain_correlation "$CURRENT_INCIDENT_DIR"
   generate_cross_incident_domain_correlation "$CURRENT_INCIDENT_DIR" "$reason"
   generate_incident_diagnosis "$CURRENT_INCIDENT_DIR" "$reason"
   print -r -- "ended=$(timestamp)" >> "$CURRENT_INCIDENT_DIR/metadata.txt"
