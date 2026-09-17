@@ -81,6 +81,10 @@ leftovers=0
 if (( leftovers == 0 )); then
   print -r -- "MacLagMonitor and its local runtime data were removed."
   print -r -- "macOS unified logs, APFS snapshots, and backups are managed separately by macOS."
+  print -r -- "Safari Debug preferences are not changed automatically."
+  print -r -- "If you enabled WebProcess PID titles only for MacLagMonitor, quit Safari and optionally restore the prior preference state with:"
+  print -r -- "  defaults delete com.apple.Safari DebugShowProcessIDsForPerTabWebProcesses"
+  print -r -- "  defaults delete com.apple.Safari IncludeInternalDebugMenu"
 else
   print -u2 -- "Some files could not be removed. Review the paths above."
   exit 1

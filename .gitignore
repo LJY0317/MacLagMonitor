@@ -2,6 +2,11 @@
 # Everything is private/local by default. Add a path below only after review.
 /*
 
+# Local-only references are intentionally private (also covered by /*).
+/.local/
+/AGENTS.md
+/STATE.md
+
 !/.gitignore
 !/README.md
 !/CHANGELOG.md

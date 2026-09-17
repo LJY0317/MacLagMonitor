@@ -119,12 +119,6 @@ fi
 
 if (( NO_LOAD == 0 )); then
   launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
-  rm -f -- \
-    "$INSTALL_ROOT/state/trigger.count" \
-    "$INSTALL_ROOT/state/episode-performance.active" \
-    "$INSTALL_ROOT/state/episode-performance.recovery" \
-    "$INSTALL_ROOT/state/episode-crash.active" \
-    "$INSTALL_ROOT/state/episode-crash.recovery"
   if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"; then
     print -u2 -- "Files were installed, but the LaunchAgent could not be started."
     print -u2 -- "Run the control script's status command and review logs/launchd-stderr.log."

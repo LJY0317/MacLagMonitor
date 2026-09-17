@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.7.4 — 2026-09-17
+
+- 기존 저빈도 `ps` 표본을 재사용하는 선택적 관심 프로세스 집계를 추가했습니다. 추가 polling 없이 프로세스 수·합산 CPU·RSS를 기록합니다.
+
+## 1.7.3 — 2026-09-14
+
+- 부모 계보 root 재탐색 회귀와 정상 trim 경로의 거짓 실패 반환을 수정하고, 부모 소실·순환·깊이·행/파일 상한을 명시적으로 기록합니다.
+- Safari lifecycle의 PID 0 오탐 종료와 동일 PID 재사용 불확실성을 수정하고, incident completion/diagnosis 상태와 재시작 복구를 명시적으로 남깁니다.
+- 설치 갱신 시 진행 중 episode 상태를 불필요하게 초기화하지 않으며 lifecycle·incident completion·unknown 상태를 격리 합성 검증 harness로 보강했습니다.
+
+## 1.7.2 — 2026-09-14
+
+- 기존 `ps` 표본을 재사용해 상위 CPU·RSS 프로세스와 같은 표본 안의 제한된 부모 관계를 작은 로컬 버퍼에 기록합니다. 실행 인자·환경변수·URL은 저장하지 않습니다.
+- Safari PID 변화와 Safari/전역 WebKit 그룹의 관측된 감소를 lifecycle 이벤트로 기록하며, 종료 이유나 인과관계는 단정하지 않습니다.
+- `set -u`에서 incident 후처리 함수가 중단되던 오류를 수정하고, 미완료 incident는 metadata에 명시합니다.
+- `memory_pressure`의 free percentage와 compressor 논리량의 의미를 문서화하고, 수집 실패를 정상 수치로 취급하지 않도록 보강했습니다.
+
 ## 1.7.1 — 2026-09-04
 
 - 인터넷 장애가 감지된 순간에만 기본 게이트웨이와 외부 숫자 IP를 짧게 확인하는 경로 진단을 추가했습니다.

@@ -4,6 +4,9 @@ macOS가 심하게 느려지거나 네트워크까지 불안정해지는 순간�
 
 ## 주요 동작
 - 메모리·swap·load·Safari/WebKit·WindowServer 상태 기록.
+- 기존 프로세스 표본에서 CPU·메모리 상위 실행 파일과 같은 표본 안의 제한된 부모 관계를 작은 로컬 버퍼에 보존.
+- 선택적으로 관심 프로세스 정규식을 지정하면 기존 `ps` 표본을 그대로 재사용해 해당 프로세스군의 개수·합산 CPU·RSS를 기록한다. 추가 polling이나 profiler는 실행하지 않는다.
+- Safari PID의 관측된 종료·재시작과 Safari/전역 WebKit 메모리 변화 기록. WebKit 수치에는 Safari 외 앱의 WebKit 프로세스가 포함될 수 있다.
 - 사고 중 8초 간격 상세 측정, 높은 WebKit CPU에서만 제한적 `sample`/`log show` 실행.
 - 인터넷 장애가 실제 감지된 순간에만 기본 게이트웨이와 외부 숫자 IP를 짧게 확인해 로컬 링크/WAN/DNS/호스트 포화 후보를 분리한다.
 - 기존 macOS `*.cpu_resource.diag`와 선택적 Safari WebProcess PID↔hostname 대조 활용.
@@ -42,9 +45,9 @@ defaults delete com.apple.Safari IncludeInternalDebugMenu
 ```
 
 ## 사고 기록과 한계
-사고 자료는 설치 위치의 `data/incidents/`에 저장되며 `timeline.tsv`, `diagnosis.txt`, resource report 요약, 제한된 WebKit sample, Safari 도메인 후보 등이 생성될 수 있다. 인터넷 장애가 트리거면 `network-path-probe.txt`에 당시 기본 게이트웨이·외부 숫자 IP ping, 인터페이스 카운터, 시스템 load를 함께 기록한다.
+사고 자료는 설치 위치의 `data/incidents/`에 저장되며 `timeline.tsv`, `diagnosis.txt`, resource report 요약, 제한된 WebKit sample, Safari 도메인 후보, 직전 프로세스·Safari lifecycle 기록 등이 생성될 수 있다. 인터넷 장애가 트리거면 `network-path-probe.txt`에 당시 기본 게이트웨이·외부 숫자 IP ping, 인터페이스 카운터, 시스템 load를 함께 기록한다.
 
-높은 프로세스 수치·반복 도메인·PID↔hostname 일치는 연관 근거이지 단독 인과 증거가 아니다. 짧은 이상은 낮은 평상시 부하를 위해 놓칠 수 있다.
+프로세스 부모 관계는 같은 `ps` 표본에서만 해석하며, 종료된 부모나 이후 PID 재사용을 추론하지 않는다. Safari 종료 관측은 강제 종료·크래시·정상 종료를 구분하지 않는다. `memory_pressure`의 free percentage는 macOS가 보고한 값이며 Activity Monitor의 메모리 압력 그래프와 같은 지표가 아니다. 높은 프로세스 수치·반복 도메인·PID↔hostname 일치는 연관 근거이지 단독 인과 증거가 아니다. 짧은 이상은 낮은 평상시 부하를 위해 놓칠 수 있다.
 
 ## 삭제와 공개 검사
 ```sh
