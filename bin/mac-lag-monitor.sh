@@ -88,6 +88,7 @@ source "$CONFIG_FILE"
 : "${SAFARI_LIFECYCLE_MEMORY_DROP_MB:=1024}"
 : "${SAFARI_LIFECYCLE_WEBKIT_DROP_COUNT:=4}"
 : "${WATCH_PROCESS_REGEX:=}"
+: "${WATCH_PROCESS_CPU_THRESHOLD:=50}"
 : "${AUX_APP_1_PROCESS_REGEX:=}"
 : "${AUX_APP_2_PROCESS_REGEX:=}"
 : "${CONTENT_FILTER_PROCESS_REGEX:=}"
@@ -633,10 +634,11 @@ collect_process_metrics() {
   WEBKIT_HOT_PID=unknown; WEBKIT_HOT_KB=unknown; MEDIAANALYSISD_CPU=unknown
   MOBILEASSETD_CPU=unknown; REPLAYD_CPU=unknown; SAFARI_START_ID=unknown
   WATCH_PROCESS_COUNT=unknown; WATCH_PROCESS_CPU=unknown; WATCH_PROCESS_KB=unknown
+  WATCH_PROCESS_HOT_CPU=unknown; WATCH_PROCESS_HOT_PID=unknown; WATCH_PROCESS_HOT_KB=unknown
   [[ "$PROCESS_SNAPSHOT_STATUS" == "ok" ]] || {
     SAFARI_GROUP_MB=unknown; WEBKIT_TOTAL_MB=unknown; WEBKIT_MAX_MB=unknown
     WINDOWSERVER_MB=unknown; AUX_APP_1_MB=unknown; AUX_APP_2_MB=unknown; WEBKIT_HOT_MB=unknown
-    WATCH_PROCESS_MB=unknown
+    WATCH_PROCESS_MB=unknown; WATCH_PROCESS_HOT_MB=unknown
     return
   }
 
@@ -645,7 +647,8 @@ collect_process_metrics() {
     SAFARI_PID SAFARI_UPTIME SAFARI_START_ID WEBKIT_PROCESS_COUNT REPORTCRASH_CPU \
     CORESYMBOLICATION_CPU CONTENT_FILTER_CPU CONTENT_FILTER_RUNNING WEBKIT_HOT_CPU \
     WEBKIT_HOT_PID WEBKIT_HOT_KB MEDIAANALYSISD_CPU MOBILEASSETD_CPU \
-    REPLAYD_CPU WATCH_PROCESS_COUNT WATCH_PROCESS_CPU WATCH_PROCESS_KB <<< "$(print -r -- "$ps_data" | awk \
+    REPLAYD_CPU WATCH_PROCESS_COUNT WATCH_PROCESS_CPU WATCH_PROCESS_KB \
+    WATCH_PROCESS_HOT_CPU WATCH_PROCESS_HOT_PID WATCH_PROCESS_HOT_KB <<< "$(print -r -- "$ps_data" | awk \
       -v aux1="$AUX_APP_1_PROCESS_REGEX" \
       -v aux2="$AUX_APP_2_PROCESS_REGEX" \
       -v watch="$WATCH_PROCESS_REGEX" \
@@ -660,7 +663,10 @@ collect_process_metrics() {
     /\/WindowServer$/ {window_cpu=$3; window_kb=$4}
     aux1 != "" && $0 ~ aux1 {aux1_kb += $4}
     aux2 != "" && $0 ~ aux2 {aux2_kb += $4}
-    watch != "" && $0 ~ watch {watch_count++; watch_cpu += $3; watch_kb += $4}
+    watch != "" && $0 ~ watch {
+      watch_count++; watch_cpu += $3; watch_kb += $4
+      if ($3 > watch_cpu_max) {watch_cpu_max=$3; watch_cpu_pid=$1; watch_cpu_kb=$4}
+    }
     /\/ReportCrash$/ {report_cpu += $3}
     /\/coresymbolicationd$/ {symbol_cpu += $3}
     filter_re != "" && $0 ~ filter_re {filter_cpu += $3; filter_running=1}
@@ -674,16 +680,17 @@ collect_process_metrics() {
         if (dash_count > 1) start_age=(dash[1]*86400)+(clock[1]*3600)+(clock[2]*60)+clock[3]
         else if (clock_count == 3) start_age=(clock[1]*3600)+(clock[2]*60)+clock[3]
         else start_age=(clock[1]*60)+clock[2]
-      }
+      } else start_age="-"
       if (safari_uptime == "") safari_uptime="-"
-      printf "%d %d %d %d %.1f %d %d %d %d %s %s %d %.1f %.1f %.1f %d %.1f %d %d %.1f %.1f %.1f %d %.1f %d\n",
+      printf "%d %d %d %d %.1f %d %d %d %d %s %s %d %.1f %.1f %.1f %d %.1f %d %d %.1f %.1f %.1f %d %.1f %d %.1f %d %d\n",
         safari+0, webkit+0, webkit_max+0, webkit_pid+0,
         window_cpu+0, window_kb+0, aux1_kb+0, aux2_kb+0,
         safari_pid+0, safari_uptime, start_age, webkit_count+0,
         report_cpu+0, symbol_cpu+0, filter_cpu+0, filter_running+0,
         webkit_cpu_max+0, webkit_cpu_pid+0, webkit_cpu_kb+0,
         mediaanalysis_cpu+0, mobileasset_cpu+0, replay_cpu+0,
-        watch_count+0, watch_cpu+0, watch_kb+0
+        watch_count+0, watch_cpu+0, watch_kb+0,
+        watch_cpu_max+0, watch_cpu_pid+0, watch_cpu_kb+0
     }')"
 
   if [[ "$SAFARI_PID" != "0" && "$SAFARI_START_ID" == <-> ]]; then
@@ -706,10 +713,14 @@ collect_process_metrics() {
   WEBKIT_HOT_MB="$(mb_from_kb "$WEBKIT_HOT_KB")"
   if [[ -n "$WATCH_PROCESS_REGEX" ]]; then
     WATCH_PROCESS_MB="$(mb_from_kb "$WATCH_PROCESS_KB")"
+    WATCH_PROCESS_HOT_MB="$(mb_from_kb "$WATCH_PROCESS_HOT_KB")"
   else
     WATCH_PROCESS_COUNT=disabled
     WATCH_PROCESS_CPU=disabled
     WATCH_PROCESS_MB=disabled
+    WATCH_PROCESS_HOT_CPU=disabled
+    WATCH_PROCESS_HOT_PID=disabled
+    WATCH_PROCESS_HOT_MB=disabled
   fi
 }
 
@@ -756,7 +767,7 @@ record_process_context() {
   (( depth >= 0 )) || depth=0
   header=$'captured_at\tsnapshot_id\tselection\tpid\tppid\tcpu_pct\trss_kb\tetime\texecutable\tparent_chain_scope'
   ensure_tsv_header "$PROCESS_CONTEXT_FILE" "$header"
-  print -r -- "$PROCESS_SNAPSHOT_DATA" | awk -v ts="$captured_at" -v sid="$snapshot_id" -v cpu_limit="$cpu_count" -v rss_limit="$rss_count" -v parent_depth="$depth" -v max_rows="$PROCESS_CONTEXT_MAX_ROWS" '
+  print -r -- "$PROCESS_SNAPSHOT_DATA" | awk -v ts="$captured_at" -v sid="$snapshot_id" -v cpu_limit="$cpu_count" -v rss_limit="$rss_count" -v parent_depth="$depth" -v max_rows="$PROCESS_CONTEXT_MAX_ROWS" -v watch_pid="${WATCH_PROCESS_HOT_PID:-}" '
     function command_name(   i, value) {
       value=$6
       for (i=7; i<=NF; i++) value=value " " $i
@@ -768,6 +779,9 @@ record_process_context() {
       order[++count]=pid
     }
     END {
+      if (watch_pid ~ /^[0-9]+$/ && watch_pid > 0 && (watch_pid in present)) {
+        selected[watch_pid]=1; roots[watch_pid]=1; roles[watch_pid]="watched_hot"
+      }
       for (rank=1; rank<=cpu_limit; rank++) {
         best=""; best_value=-1
         for (i=1; i<=count; i++) { pid=order[i]; if (!cpu_used[pid] && cpu[pid] > best_value) { best=pid; best_value=cpu[pid] } }
@@ -879,6 +893,9 @@ determine_trigger_flags() {
   (( $(integer_value "$WEBKIT_MAX_MB") >= WEBKIT_PROCESS_MB_THRESHOLD )) && context_flags+=("webkit-process-high")
   (( $(integer_value "$WINDOWSERVER_CPU") >= WINDOWSERVER_CPU_THRESHOLD )) && context_flags+=("windowserver-high")
   (( $(integer_value "$WEBKIT_HOT_CPU") >= WEBKIT_CPU_SAMPLE_THRESHOLD )) && context_flags+=("webkit-cpu-high")
+  if [[ "$WATCH_PROCESS_HOT_CPU" != "disabled" ]] && (( $(integer_value "$WATCH_PROCESS_HOT_CPU") >= WATCH_PROCESS_CPU_THRESHOLD )); then
+    context_flags+=("watched-process-cpu-high")
+  fi
 
   # Incident thresholds are intentionally much stricter so routine heavy use is
   # recorded as context without automatically starting a four-minute capture.
@@ -888,7 +905,6 @@ determine_trigger_flags() {
   (( $(integer_value "$WEBKIT_MAX_MB") >= INCIDENT_WEBKIT_PROCESS_MB_THRESHOLD )) && trigger_flags+=("webkit-process-high")
   (( $(integer_value "$WINDOWSERVER_CPU") >= INCIDENT_WINDOWSERVER_CPU_THRESHOLD )) && trigger_flags+=("windowserver-high")
   (( $(integer_value "$WEBKIT_HOT_CPU") >= INCIDENT_WEBKIT_CPU_THRESHOLD )) && trigger_flags+=("webkit-cpu-high")
-
   if (( $(integer_value "$REPORTCRASH_CPU") >= REPORTCRASH_CPU_THRESHOLD )); then
     context_flags+=("crashreporter-high")
     trigger_flags+=("crashreporter-high")
@@ -928,7 +944,7 @@ determine_trigger_flags() {
 }
 
 summary_header() {
-  print -r -- $'timestamp\tpower\tinterval_sec\tmemory_pressure_free_pct\tvm_free_mb\tcompressor_physical_mb\tcompressor_logical_mb\tswap_used_mb\tload_1m\tsafari_and_all_webkit_group_mb\tall_webkit_webcontent_mb\twebkit_max_mb\twebkit_max_pid\twindowserver_cpu_pct\twindowserver_mb\taux_app_1_mb\taux_app_2_mb\twatched_process_count\twatched_process_cpu_pct\twatched_process_rss_mb\tnetwork_state\tinternet_state\tdns_state\tinternet_latency_ms\tinternet_probe_codes\tinternet_last_success\toutage_started\tsafari_pid\tsafari_uptime\tall_webkit_webcontent_count\treportcrash_cpu_pct\tcoresymbolication_cpu_pct\tcontent_filter_cpu_pct\twebkit_hot_cpu_pct\twebkit_hot_pid\twebkit_hot_mb\tmediaanalysisd_cpu_pct\tmobileassetd_cpu_pct\treplayd_cpu_pct\tprocess_snapshot_status\tflags'
+  print -r -- $'timestamp\tpower\tinterval_sec\tmemory_pressure_free_pct\tvm_free_mb\tcompressor_physical_mb\tcompressor_logical_mb\tswap_used_mb\tload_1m\tsafari_and_all_webkit_group_mb\tall_webkit_webcontent_mb\twebkit_max_mb\twebkit_max_pid\twindowserver_cpu_pct\twindowserver_mb\taux_app_1_mb\taux_app_2_mb\twatched_process_count\twatched_process_cpu_pct\twatched_process_rss_mb\twatched_process_hot_cpu_pct\twatched_process_hot_pid\twatched_process_hot_rss_mb\tnetwork_state\tinternet_state\tdns_state\tinternet_latency_ms\tinternet_probe_codes\tinternet_last_success\toutage_started\tsafari_pid\tsafari_uptime\tall_webkit_webcontent_count\treportcrash_cpu_pct\tcoresymbolication_cpu_pct\tcontent_filter_cpu_pct\twebkit_hot_cpu_pct\twebkit_hot_pid\twebkit_hot_mb\tmediaanalysisd_cpu_pct\tmobileassetd_cpu_pct\treplayd_cpu_pct\tprocess_snapshot_status\tflags'
 }
 
 ensure_summary_header() {
@@ -995,7 +1011,7 @@ collect_and_write_snapshot() {
     [[ -n "$TRIGGER_FLAGS" ]] && TRIGGER_FLAGS+=","
     TRIGGER_FLAGS+="monitor-sample-stall"
   fi
-  line="${captured_at}${tab}${power}${tab}${interval}${tab}${MEMORY_FREE_PERCENT}${tab}${VM_FREE_MB}${tab}${COMPRESSOR_MB}${tab}${COMPRESSED_LOGICAL_MB}${tab}${SWAP_USED_MB}${tab}${load1}${tab}${SAFARI_GROUP_MB}${tab}${WEBKIT_TOTAL_MB}${tab}${WEBKIT_MAX_MB}${tab}${WEBKIT_MAX_PID}${tab}${WINDOWSERVER_CPU}${tab}${WINDOWSERVER_MB}${tab}${AUX_APP_1_MB}${tab}${AUX_APP_2_MB}${tab}${WATCH_PROCESS_COUNT}${tab}${WATCH_PROCESS_CPU}${tab}${WATCH_PROCESS_MB}${tab}${network}${tab}${INTERNET_STATE}${tab}${DNS_STATE}${tab}${INTERNET_LATENCY_MS}${tab}${INTERNET_PROBE_CODES}${tab}${INTERNET_LAST_SUCCESS}${tab}${INTERNET_OUTAGE_STARTED}${tab}${SAFARI_PID}${tab}${SAFARI_UPTIME}${tab}${WEBKIT_PROCESS_COUNT}${tab}${REPORTCRASH_CPU}${tab}${CORESYMBOLICATION_CPU}${tab}${CONTENT_FILTER_CPU}${tab}${WEBKIT_HOT_CPU}${tab}${WEBKIT_HOT_PID}${tab}${WEBKIT_HOT_MB}${tab}${MEDIAANALYSISD_CPU}${tab}${MOBILEASSETD_CPU}${tab}${REPLAYD_CPU}${tab}${PROCESS_SNAPSHOT_STATUS}${tab}${CONTEXT_FLAGS}"
+  line="${captured_at}${tab}${power}${tab}${interval}${tab}${MEMORY_FREE_PERCENT}${tab}${VM_FREE_MB}${tab}${COMPRESSOR_MB}${tab}${COMPRESSED_LOGICAL_MB}${tab}${SWAP_USED_MB}${tab}${load1}${tab}${SAFARI_GROUP_MB}${tab}${WEBKIT_TOTAL_MB}${tab}${WEBKIT_MAX_MB}${tab}${WEBKIT_MAX_PID}${tab}${WINDOWSERVER_CPU}${tab}${WINDOWSERVER_MB}${tab}${AUX_APP_1_MB}${tab}${AUX_APP_2_MB}${tab}${WATCH_PROCESS_COUNT}${tab}${WATCH_PROCESS_CPU}${tab}${WATCH_PROCESS_MB}${tab}${WATCH_PROCESS_HOT_CPU}${tab}${WATCH_PROCESS_HOT_PID}${tab}${WATCH_PROCESS_HOT_MB}${tab}${network}${tab}${INTERNET_STATE}${tab}${DNS_STATE}${tab}${INTERNET_LATENCY_MS}${tab}${INTERNET_PROBE_CODES}${tab}${INTERNET_LAST_SUCCESS}${tab}${INTERNET_OUTAGE_STARTED}${tab}${SAFARI_PID}${tab}${SAFARI_UPTIME}${tab}${WEBKIT_PROCESS_COUNT}${tab}${REPORTCRASH_CPU}${tab}${CORESYMBOLICATION_CPU}${tab}${CONTENT_FILTER_CPU}${tab}${WEBKIT_HOT_CPU}${tab}${WEBKIT_HOT_PID}${tab}${WEBKIT_HOT_MB}${tab}${MEDIAANALYSISD_CPU}${tab}${MOBILEASSETD_CPU}${tab}${REPLAYD_CPU}${tab}${PROCESS_SNAPSHOT_STATUS}${tab}${CONTEXT_FLAGS}"
   print -r -- "$line" >> "$SUMMARY_FILE"
   [[ -n "$destination" ]] && print -r -- "$line" >> "$destination"
 

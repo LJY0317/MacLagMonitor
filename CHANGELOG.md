@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.7.6 — 2026-09-29
+
+- 기존 저빈도 `ps` 표본을 재사용하는 관심 프로세스 진단에 hottest PID/CPU/RSS를 추가하고, 높은 CPU를 context 신호로 기록하며 해당 PID를 bounded process context에 항상 포함합니다. 관심 프로세스 하나의 CPU만으로 무거운 incident 수집을 자동 시작하지 않으며, 별도 polling이나 상시 profiler도 추가하지 않습니다.
+
 ## 1.7.5 — 2026-09-26
 
 - 평상시 HTTPS 도달성 확인을 별도 5분 cadence로 캐시하고, primary 성공 시 secondary probe를 생략해 routine network/process wakeup을 줄였습니다. route 상실과 복구는 기존처럼 다음 표본에서 즉시 처리합니다.
