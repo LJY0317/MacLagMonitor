@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.7 — 2026-10-05
+
+- incident·재부팅 진단을 열 이름 기준으로 읽고 잘못된 표본을 제외해 schema 변경 시 오진을 방지합니다. 인터넷 장애와 동시 자원 활동의 인과를 구분합니다.
+- 인터넷 장애 시작 때만 resolver·인터페이스·proxy·VPN 상태와 제한된 숫자 IP TCP 검사를 추가합니다. 평상시 검사 간격·프로세스 수집은 유지합니다.
+
 ## 1.7.6 — 2026-09-29
 
 - 기존 저빈도 `ps` 표본을 재사용하는 관심 프로세스 진단에 hottest PID/CPU/RSS를 추가하고, 높은 CPU를 context 신호로 기록하며 해당 PID를 bounded process context에 항상 포함합니다. 관심 프로세스 하나의 CPU만으로 무거운 incident 수집을 자동 시작하지 않으며, 별도 polling이나 상시 profiler도 추가하지 않습니다.

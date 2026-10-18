@@ -504,6 +504,7 @@ capture_outage_path_diagnostics() {
   local incident_dir="$1" output
   output="$incident_dir/network-path-probe.txt"
   local route_text gateway interface gateway_output external_output
+  local tcp_exit=99 tcp_output network_context
   local gateway_exit=99 external_exit=99 load1 load_per_cpu load_high=0
   local classification="unresolved" interpretation=""
 
@@ -525,6 +526,19 @@ capture_outage_path_diagnostics() {
   fi
   external_output="$(/sbin/ping -n -q -c 3 -W 1000 1.1.1.1 2>&1)"
   external_exit=$?
+  tcp_output="$(/usr/bin/nc -n -z -G 2 -w 2 1.1.1.1 443 2>&1)"
+  tcp_exit=$?
+  # Only structural resolver/routes/proxy/VPN state; no SSID, page data or VPN credentials.
+  network_context="$(
+    print -r -- '--- resolver state ---'
+    /usr/sbin/scutil --dns | awk '/resolver #|nameserver\[|if_index|flags|reach/ {print; if (++n >= 80) exit}'
+    print -r -- '--- network interfaces ---'
+    /usr/sbin/scutil --nwi | head -n 35
+    print -r -- '--- proxy flags ---'
+    /usr/sbin/scutil --proxy | awk '/Enable|Port/ {print; if (++n >= 16) exit}'
+    print -r -- '--- VPN counts ---'
+    /usr/sbin/scutil --nc list | awk '/\(Connected\)/ {connected++} /\(Connecting\)/ {connecting++} END {printf "connected=%d connecting=%d\n", connected, connecting}'
+  )"
 
   (( gateway_exit == 0 )) && NETWORK_PATH_GATEWAY_STATUS="reachable" || NETWORK_PATH_GATEWAY_STATUS="unreachable"
   (( external_exit == 0 )) && NETWORK_PATH_EXTERNAL_STATUS="reachable" || NETWORK_PATH_EXTERNAL_STATUS="unreachable"
@@ -532,10 +546,16 @@ capture_outage_path_diagnostics() {
   if [[ -z "$gateway" ]]; then
     classification="local-route-missing"
     interpretation="기본 게이트웨이를 찾지 못해 로컬 네트워크 경로 문제 가능성이 큼"
+  elif (( tcp_exit == 0 )) && [[ "${DNS_STATE:-unknown}" == "failed" ]]; then
+    classification="dns-resolution-failure-with-numeric-tcp-reachable"
+    interpretation="외부 숫자 IP TCP 연결은 성공하지만 이름 조회 실패. resolver·VPN 경로 비교 필요; ICMP 무응답은 원인 증거가 아님"
+  elif (( tcp_exit == 0 )); then
+    classification="https-or-transport-specific-failure"
+    interpretation="외부 숫자 IP TCP 도달 가능. HTTPS·TLS·이름 기반 필터·서비스 경로를 비교; ICMP 무응답만으로 링크 장애를 확정하지 않음"
   elif (( gateway_exit != 0 )); then
-    classification="local-link-or-router-unreachable"
-    interpretation="기본 게이트웨이 응답이 없어 Wi-Fi/로컬 링크/공유기 구간을 우선 확인"
-  elif (( external_exit != 0 )); then
+    classification="local-link-or-icmp-filtering"
+    interpretation="기본 게이트웨이 ICMP 응답 없음. 로컬 링크·필터 후보이며 ICMP 차단 가능성 때문에 원인 미확정"
+  elif (( external_exit != 0 && tcp_exit != 0 )); then
     classification="upstream-path-or-icmp-filtering"
     interpretation="공유기는 응답하지만 외부 숫자 IP는 응답하지 않음. WAN/상위 경로 문제 가능성이 있으나 ICMP 차단 가능성도 있음"
   elif [[ "${DNS_STATE:-unknown}" == "failed" ]]; then
@@ -566,6 +586,11 @@ capture_outage_path_diagnostics() {
     print -r -- "gateway_ping_status=$NETWORK_PATH_GATEWAY_STATUS"
     print -r -- "external_numeric_target=1.1.1.1"
     print -r -- "external_ping_status=$NETWORK_PATH_EXTERNAL_STATUS"
+    print -r -- "external_numeric_tcp_target=1.1.1.1:443"
+    print -r -- "external_tcp_exit=$tcp_exit"
+    print -r -- "diagnostic_scope=one-shot-at-outage-start; no network settings changed"
+    print -r -- "probe_limit=single external target; reachability does not identify root cause"
+    print -r -- "$network_context"
     print -r -- ""
     print -r -- "--- default route ---"
     print -r -- "$route_text"
@@ -1268,9 +1293,11 @@ generate_webkit_pid_domain_correlation() {
         target_evidence[$pid]="${target_evidence[$pid]:+${target_evidence[$pid]},}$evidence"
       fi
     done < <(awk -F '\t' -v mem="$INCIDENT_WEBKIT_PROCESS_MB_THRESHOLD" -v cpu="$WEBKIT_CPU_SAMPLE_THRESHOLD" '
-      NR > 1 && NF >= 38 {
-        if (($12+0) >= mem && ($13+0) > 0) print ($13+0) "\ttimeline-high-memory"
-        if (($31+0) >= cpu && ($32+0) > 0) print ($32+0) "\ttimeline-hot-cpu"
+NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
+    function value(name) {return col[name] ? $(col[name]) : ""}
+      NR > 1 && NF == columns {
+        if (value("webkit_max_mb") ~ /^[0-9]+(\.[0-9]+)?$/ && value("webkit_max_pid") ~ /^[0-9]+$/ && value("webkit_max_mb")+0 >= mem && value("webkit_max_pid")+0 > 0) print value("webkit_max_pid") "\ttimeline-high-memory"
+        if (value("webkit_hot_cpu_pct") ~ /^[0-9]+(\.[0-9]+)?$/ && value("webkit_hot_pid") ~ /^[0-9]+$/ && value("webkit_hot_cpu_pct")+0 >= cpu && value("webkit_hot_pid")+0 > 0) print value("webkit_hot_pid") "\ttimeline-hot-cpu"
       }
     ' "$incident_dir/timeline.tsv" 2>/dev/null | sort -u)
   fi
@@ -1862,24 +1889,30 @@ generate_incident_diagnosis() {
   output="$incident_dir/diagnosis.txt"
   metrics="$(awk -F '\t' '
     BEGIN {minfree=""}
-    NF >= 37 && $4 ~ /^[0-9]+(\.[0-9]+)?$/ {
+NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
+    function value(name) {return col[name] ? $(col[name]) : ""}
+    NF == columns && value("memory_pressure_free_pct") ~ /^[0-9]+(\.[0-9]+)?$/ {
+      numeric="memory_pressure_free_pct compressor_physical_mb swap_used_mb load_1m safari_and_all_webkit_group_mb all_webkit_webcontent_mb windowserver_cpu_pct all_webkit_webcontent_count reportcrash_cpu_pct coresymbolication_cpu_pct content_filter_cpu_pct webkit_hot_cpu_pct webkit_hot_pid mediaanalysisd_cpu_pct mobileassetd_cpu_pct replayd_cpu_pct"
+      n=split(numeric, names, " "); good=1
+      for (j=1;j<=n;j++) if (value(names[j]) !~ /^[0-9]+(\.[0-9]+)?$/) good=0
+      if (!good || value("process_snapshot_status") != "ok") next
       valid++
-      if ($4 ~ /^[0-9]+(\.[0-9]+)?$/ && (minfree == "" || ($4+0) < minfree)) minfree=$4+0
-      if (($6+0) > comp) comp=$6+0
-      if (($8+0) > swap) swap=$8+0
-      if (($9+0) > load) load=$9+0
-      if (($10+0) > safari) safari=$10+0
-      if (($11+0) > webkit) webkit=$11+0
-      if (($14+0) > ws) ws=$14+0
-      if (($27+0) > wc) wc=$27+0
-      if (($28+0) > report) report=$28+0
-      if (($29+0) > symbol) symbol=$29+0
-      if (($30+0) > content_filter) content_filter=$30+0
-      if (($31+0) > webkit_hot) {webkit_hot=$31+0; hot_pid=$32+0}
-      if (($34+0) > mediaanalysis) mediaanalysis=$34+0
-      if (($35+0) > mobileasset) mobileasset=$35+0
-      if (($36+0) > replay) replay=$36+0
-      if ($19 != "online" && $19 != "disabled") offline=1
+      if (value("memory_pressure_free_pct") ~ /^[0-9]+(\.[0-9]+)?$/ && (minfree == "" || (value("memory_pressure_free_pct")+0) < minfree)) minfree=value("memory_pressure_free_pct")+0
+      if ((value("compressor_physical_mb")+0) > comp) comp=value("compressor_physical_mb")+0
+      if ((value("swap_used_mb")+0) > swap) swap=value("swap_used_mb")+0
+      if ((value("load_1m")+0) > load) load=value("load_1m")+0
+      if ((value("safari_and_all_webkit_group_mb")+0) > safari) safari=value("safari_and_all_webkit_group_mb")+0
+      if ((value("all_webkit_webcontent_mb")+0) > webkit) webkit=value("all_webkit_webcontent_mb")+0
+      if ((value("windowserver_cpu_pct")+0) > ws) ws=value("windowserver_cpu_pct")+0
+      if ((value("all_webkit_webcontent_count")+0) > wc) wc=value("all_webkit_webcontent_count")+0
+      if ((value("reportcrash_cpu_pct")+0) > report) report=value("reportcrash_cpu_pct")+0
+      if ((value("coresymbolication_cpu_pct")+0) > symbol) symbol=value("coresymbolication_cpu_pct")+0
+      if ((value("content_filter_cpu_pct")+0) > content_filter) content_filter=value("content_filter_cpu_pct")+0
+      if ((value("webkit_hot_cpu_pct")+0) > webkit_hot) {webkit_hot=value("webkit_hot_cpu_pct")+0; hot_pid=value("webkit_hot_pid")+0}
+      if ((value("mediaanalysisd_cpu_pct")+0) > mediaanalysis) mediaanalysis=value("mediaanalysisd_cpu_pct")+0
+      if ((value("mobileassetd_cpu_pct")+0) > mobileasset) mobileasset=value("mobileassetd_cpu_pct")+0
+      if ((value("replayd_cpu_pct")+0) > replay) replay=value("replayd_cpu_pct")+0
+      if (value("internet_state") != "online" && value("internet_state") != "disabled") offline=1
     }
     END {if (valid == 0) {print "unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown"; exit} if (minfree == "") minfree="unknown"; printf "%s %.1f %.1f %.2f %.1f %.1f %.1f %.1f %.1f %.1f %.0f %d %.1f %d %.1f %.1f %.1f\n", minfree,comp,swap,load,safari,webkit,ws,report,symbol,content_filter,wc,offline,webkit_hot,hot_pid,mediaanalysis,mobileasset,replay}
   ' "$timeline" 2>/dev/null)"
@@ -1926,6 +1959,9 @@ generate_incident_diagnosis() {
   if [[ ",$reason," == *",internet-down,"* && "$network_path_classification" == "host-saturation-or-transport-contention" ]] && (( load_factor == 1 && network_factor == 1 )); then
     primary="probable-host-saturation-affecting-network"
     classification="probable-host-saturation-affecting-network"
+  elif [[ ",$reason," == *",internet-down,"* ]] && (( network_factor == 1 )); then
+    primary="general-network-or-dns-problem"
+    classification="network-failure-with-unproven-cause"
   elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
     primary="probable-webkit-content-runaway"
     classification="probable-webkit-content-runaway"
@@ -1982,6 +2018,8 @@ generate_incident_diagnosis() {
     fi
     if [[ "$classification" == "probable-host-saturation-affecting-network" ]]; then
       print -r -- "recommended_action=공유기와 외부 숫자 IP가 응답하는 동안 HTTPS 실패와 높은 시스템 load가 겹침. top CPU 프로세스 수를 줄이거나 동시 작업 수를 낮춘 뒤 같은 네트워크에서 재현 여부를 비교"
+    elif [[ "$classification" == "network-failure-with-unproven-cause" ]]; then
+      print -r -- "recommended_action=network-path-probe.txt의 DNS·TCP·기본 경로·VPN 증거를 비교. 동시 CPU 활동은 별도 관측이며 인터넷 장애 원인으로 확정하지 않음"
     elif (( PID_DOMAIN_MATCH_FOUND == 1 && MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
       print -r -- "recommended_action=macOS WebKit resource PID $PID_DOMAIN_MATCH_PID가 사고 시 Safari 도메인 '$PID_DOMAIN_MATCH_DOMAIN'과 직접 매핑됨. 이 도메인 탭부터 격리해 재현 여부를 확인하되 iframe·worker Site Isolation 가능성 때문에 단독 인과 증거로 보지는 말 것"
     elif (( PID_DOMAIN_MATCH_FOUND == 1 )); then
@@ -2065,21 +2103,23 @@ generate_reboot_postmortem() {
     }
   ' "$SUMMARY_FILE" 2>/dev/null)"
 
-  metrics="$(print -r -- "$rows" | awk -F '\t' '
+  metrics="$({ head -n 1 "$SUMMARY_FILE"; print -r -- "$rows"; } | awk -F '\t' '
     BEGIN {minfree=101; prevSafari=-1}
-    NF >= 37 {
-      if (($4+0) < minfree) minfree=$4+0
-      if (($6+0) > comp) comp=$6+0
-      if (($8+0) > swap) swap=$8+0
-      if (($10+0) > safari) safari=$10+0
-      if (($12+0) > webproc) webproc=$12+0
-      if (($14+0) > ws) ws=$14+0
-      if (($31+0) > whot) {whot=$31+0; hotpid=$32+0}
+NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
+    function value(name) {return col[name] ? $(col[name]) : ""}
+    NF == columns && value("memory_pressure_free_pct") ~ /^[0-9]+(\.[0-9]+)?$/ {
+      if ((value("memory_pressure_free_pct")+0) < minfree) minfree=value("memory_pressure_free_pct")+0
+      if ((value("compressor_physical_mb")+0) > comp) comp=value("compressor_physical_mb")+0
+      if ((value("swap_used_mb")+0) > swap) swap=value("swap_used_mb")+0
+      if ((value("safari_and_all_webkit_group_mb")+0) > safari) safari=value("safari_and_all_webkit_group_mb")+0
+      if ((value("webkit_max_mb")+0) > webproc) webproc=value("webkit_max_mb")+0
+      if ((value("windowserver_cpu_pct")+0) > ws) ws=value("windowserver_cpu_pct")+0
+      if ((value("webkit_hot_cpu_pct")+0) > whot) {whot=value("webkit_hot_cpu_pct")+0; hotpid=value("webkit_hot_pid")+0}
       if (prevSafari >= 0) {
-        sd=prevSafari-($10+0); cd=prevComp-($6+0); swd=prevSwap-($8+0)
-        if (sd > maxsd) {maxsd=sd; maxcd=cd; maxswd=swd; droptime=$1}
+        sd=prevSafari-(value("safari_and_all_webkit_group_mb")+0); cd=prevComp-(value("compressor_physical_mb")+0); swd=prevSwap-(value("swap_used_mb")+0)
+        if (sd > maxsd) {maxsd=sd; maxcd=cd; maxswd=swd; droptime=value("timestamp")}
       }
-      prevSafari=$10+0; prevComp=$6+0; prevSwap=$8+0
+      prevSafari=value("safari_and_all_webkit_group_mb")+0; prevComp=value("compressor_physical_mb")+0; prevSwap=value("swap_used_mb")+0
     }
     END {printf "%.0f %.1f %.1f %.1f %.1f %.1f %.1f %d %.1f %.1f %.1f %s\n",minfree,comp,swap,safari,webproc,ws,whot,hotpid,maxsd,maxcd,maxswd,droptime}
   ')"
@@ -2189,6 +2229,7 @@ run_incident_capture() {
   CURRENT_INCIDENT_DIR="$INCIDENTS_DIR/$incident_id"
   mkdir -p "$CURRENT_INCIDENT_DIR"
   incident_file="$CURRENT_INCIDENT_DIR/timeline.tsv"
+  summary_header >| "$incident_file"
   ensure_summary_header
   base_lines=$(( PRE_TRIGGER_MINUTES * 60 / AC_INTERVAL_SECONDS + 20 ))
   {
