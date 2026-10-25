@@ -476,6 +476,10 @@ collect_internet_metrics() {
   else
     details="primary=${p_exit}/${p_http},secondary=${s_exit}/${s_http}"
   fi
+  # Preserve timings already measured by curl; a timeout alone cannot identify
+  # whether name lookup, TCP, TLS or the HTTP response stalled. No extra probes.
+  details+=",primary_seconds=dns:${p_dns}/tcp:${p_connect}/tls:${p_tls}/total:${p_total}"
+  (( p_ok == 0 )) && details+=",secondary_seconds=dns:${s_dns}/tcp:${s_connect}/tls:${s_tls}/total:${s_total}"
   INTERNET_PROBE_CODES="$details"
   if (( p_ok == 1 || s_ok == 1 )); then
     INTERNET_STATE="online"
@@ -1655,8 +1659,8 @@ capture_recent_system_logs() {
 
   (
     ulimit -f $(( max_temp / 512 )) 2>/dev/null || true
-    exec "$LOG_BIN" show --start "$start_text" --end "$end_text" --style compact \
-      --predicate '(eventMessage CONTAINS[c] "memory pressure" OR eventMessage CONTAINS[c] "jetsam" OR eventMessage CONTAINS[c] "network is unreachable" OR eventMessage CONTAINS[c] "invalid message" OR eventMessage CONTAINS[c] "EXC_GUARD" OR (process == "mediaanalysisd" AND (eventMessage CONTAINS[c] "MADService" OR eventMessage CONTAINS[c] "photos.textunderstanding" OR eventMessage CONTAINS[c] "background processing")) OR (process == "mobileassetd" AND (eventMessage CONTAINS[c] "requested purge-all" OR eventMessage CONTAINS[c] "Found no downloads" OR eventMessage CONTAINS[c] "download" OR eventMessage CONTAINS[c] "stale entry")) OR process == "replayd" OR process == "ReportCrash" OR process == "coresymbolicationd")'
+    exec "$LOG_BIN" show --start "$start_text" --end "$end_text" --style compact --info \
+      --predicate '(eventMessage CONTAINS[c] "memory pressure" OR eventMessage CONTAINS[c] "jetsam" OR eventMessage CONTAINS[c] "network is unreachable" OR eventMessage CONTAINS[c] "invalid message" OR eventMessage CONTAINS[c] "EXC_GUARD" OR (process == "mediaanalysisd" AND (eventMessage CONTAINS[c] "MADService" OR eventMessage CONTAINS[c] "photos.textunderstanding" OR eventMessage CONTAINS[c] "background processing")) OR (process == "mobileassetd" AND (eventMessage CONTAINS[c] "requested purge-all" OR eventMessage CONTAINS[c] "Found no downloads" OR eventMessage CONTAINS[c] "download" OR eventMessage CONTAINS[c] "stale entry")) OR process == "replayd" OR process == "ReportCrash" OR process == "coresymbolicationd" OR (process == "configd" AND (eventMessage CONTAINS[c] "network changed:" OR (eventMessage CONTAINS[c] "DHCP " AND eventMessage CONTAINS[c] "status ="))) OR (process CONTAINS[c] "tailscale" AND (eventMessage CONTAINS[c] "setPaused(" OR eventMessage CONTAINS[c] "control: NetInfo:" OR eventMessage CONTAINS[c] "netmap: got new dial plan" OR eventMessage CONTAINS[c] "CreateEndpoint error" OR eventMessage CONTAINS[c] "ingress: denied")))'
   ) >| "$temp" 2>/dev/null &
   LOG_CAPTURE_PID=$!
 
