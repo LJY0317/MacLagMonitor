@@ -67,13 +67,11 @@ source "$CONFIG_FILE"
 : "${SAMPLE_STALL_TRIGGER_SECONDS:=10}"
 : "${SAFARI_DIAGNOSTICS_ENABLED:=1}"
 : "${SAFARI_FAULT_EXTRACT_MAX_KB:=256}"
-: "${SAFARI_FAULT_MAX_REPORTS:=2}"
 : "${STORAGE_MAINTENANCE_INTERVAL_SECONDS:=21600}"
 : "${LAUNCHD_LOG_SIZE_LIMIT_MB:=2}"
 : "${SUMMARY_LEGACY_RETENTION_DAYS:=30}"
-: "${SUMMARY_LEGACY_MAX_FILES:=4}"
 : "${SUMMARY_LEGACY_SIZE_LIMIT_MB:=20}"
-: "${MACOS_RESOURCE_REPORT_MAX_FILES:=3}"
+: "${MACOS_RESOURCE_REPORT_MAX_KB:=256}"
 : "${REBOOT_POSTMORTEM_ROWS:=40}"
 : "${DOMAIN_CORRELATION_MAX_INCIDENTS:=10}"
 : "${DOMAIN_CORRELATION_MIN_REPEAT:=2}"
@@ -1497,25 +1495,15 @@ directory_kb() {
 }
 
 rotate_legacy_summaries() {
-  local count total_bytes oldest
+  local total_bytes oldest
 
   [[ "$SUMMARY_LEGACY_RETENTION_DAYS" == <-> ]] || SUMMARY_LEGACY_RETENTION_DAYS=30
-  [[ "$SUMMARY_LEGACY_MAX_FILES" == <-> ]] || SUMMARY_LEGACY_MAX_FILES=4
   [[ "$SUMMARY_LEGACY_SIZE_LIMIT_MB" == <-> ]] || SUMMARY_LEGACY_SIZE_LIMIT_MB=20
 
   while IFS= read -r old; do
     [[ -n "$old" && -f "$old" ]] && rm -f -- "$old"
   done < <(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' \
     -mtime "+${SUMMARY_LEGACY_RETENTION_DAYS}" -print 2>/dev/null)
-
-  count="$(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' -print 2>/dev/null | wc -l | tr -d ' ')"
-  [[ "$count" == <-> ]] || count=0
-  while (( count > SUMMARY_LEGACY_MAX_FILES )); do
-    oldest="$(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' -print 2>/dev/null | sort | head -n 1)"
-    [[ -n "$oldest" && -f "$oldest" ]] || break
-    rm -f -- "$oldest"
-    (( count-- ))
-  done
 
   total_bytes="$(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' \
     -exec stat -f '%z' {} + 2>/dev/null | awk '{sum += $1} END {print sum+0}')"
@@ -1532,7 +1520,7 @@ rotate_legacy_summaries() {
 
 rotate_storage() {
   local summary_limit_bytes total_limit_kb incidents_limit_kb single_limit_bytes
-  local dir file total oldest incident_count incidents_kb largest
+  local dir file total oldest incidents_kb largest
   summary_limit_bytes=$(( SUMMARY_SIZE_LIMIT_MB * 1024 * 1024 ))
   single_limit_bytes=$(( SINGLE_INCIDENT_SIZE_LIMIT_MB * 1024 * 1024 ))
   total_limit_kb=$(( TOTAL_SIZE_LIMIT_MB * 1024 ))
@@ -1572,14 +1560,6 @@ rotate_storage() {
         rm -f -- "$largest"
       done
     fi
-  done
-
-  incident_count="$(find "$INCIDENTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
-  while (( incident_count > MAX_INCIDENT_COUNT )); do
-    oldest="$(find "$INCIDENTS_DIR" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort | head -n 1)"
-    [[ -n "$oldest" ]] || break
-    safe_delete_directory "$oldest"
-    (( incident_count-- ))
   done
 
   incidents_kb="$(directory_kb "$INCIDENTS_DIR")"
@@ -1802,7 +1782,7 @@ capture_safari_fault_reports() {
     -maxdepth 1 -type f \
     \( -name 'ExcUserFault_Safari*.ips' -o -name '*WebKit*.ips' -o -name 'Safari*.ips' \
        -o -name 'coresymbolicationd*.diag' -o -name 'ReportCrash*.diag' \) \
-    -mmin "-${SYSTEM_LOG_LOOKBACK_MINUTES}" -print 2>/dev/null | sort -r | head -n "$SAFARI_FAULT_MAX_REPORTS")}" )
+    -mmin "-${SYSTEM_LOG_LOOKBACK_MINUTES}" -print 2>/dev/null | sort -r)}" )
 
   : >| "$temp"
   for report in "${reports[@]}"; do
@@ -1819,6 +1799,7 @@ capture_safari_fault_reports() {
     print -r -- "key_symbols:" >> "$temp"
     /usr/bin/grep -o 'symbol":"[^"]*' "$report" 2>/dev/null | head -n 16 | cut -c 1-1024 >> "$temp" || true
     print -r -- "" >> "$temp"
+    (( $(stat -f '%z' "$temp" 2>/dev/null || print 0) >= max_bytes )) && break
   done
 
   if (( count == 0 )); then
@@ -1894,7 +1875,10 @@ capture_macos_resource_reports() {
         MACOS_RESOURCE_STACK_HINT="$stack_hint"
       fi
     fi
-    (( count >= MACOS_RESOURCE_REPORT_MAX_FILES )) && break
+    if (( $(stat -f '%z' "$output" 2>/dev/null || print 0) >= MACOS_RESOURCE_REPORT_MAX_KB * 1024 )); then
+      trim_file_to_bytes "$output" $(( MACOS_RESOURCE_REPORT_MAX_KB * 1024 ))
+      break
+    fi
   done
 
   if (( count == 0 )); then

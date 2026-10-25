@@ -64,3 +64,5 @@ HTTPS 검사 기록의 `primary_seconds`·`secondary_seconds`는 이름 조회·
 재부팅 전후 네트워크 비교가 필요할 때 `"$HOME/Library/Application Support/MacLagMonitor/bin/mac-lag-monitorctl.sh" prepare-reboot`를 실행합니다. `data/network-reboot-before.txt`와 다음 부팅 시 한 번만 생성되는 `network-reboot-after.txt`를 비교합니다. 파일은 각각 최대 64KiB이며 다음 비교 때 갱신됩니다. 로그인 직후 기록은 네트워크·VPN 준비 전일 수 있습니다. 인터넷 검사 비활성화 설정을 존중하며 추가 상시 감시는 없습니다.
 
 현재 연결만 즉시 진단하려면 `"$HOME/Library/Application Support/MacLagMonitor/bin/mac-lag-monitorctl.sh" network`를 실행합니다. DNS·IPv4/IPv6 경로·VPN 연결 수·프록시 사용 여부·두 HTTPS 검사의 단계별 결과를 `data/network-current.txt`에 덮어씁니다(최대 64KiB). URL·SSID·인증정보와 curl 오류 원문은 저장하지 않으며 추가 상시 감시는 없습니다.
+
+보관은 파일 개수 대신 기간·용량으로 제한합니다. 기본 전체 200MiB, 사고 150MiB/7일, 과거 요약 20MiB/30일이며 오래된 기록부터 정리합니다.
