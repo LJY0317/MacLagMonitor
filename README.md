@@ -60,3 +60,5 @@ zsh bin/check-public-tree.sh
 네트워크 장애 시작 시에는 resolver·인터페이스·proxy 설정 여부·VPN 연결 수와 숫자 IP의 TCP 도달성도 한 번만 확인합니다. TCP 검사는 최대 2초이며 새 상시 polling은 없습니다. 한 대상의 실패나 동시 CPU 활동만으로 장애 원인을 확정하지 않습니다. 진단은 열 이름과 완전한 표본을 기준으로 계산하며, schema가 불명확한 과거 자료는 근거 부족으로 처리합니다.
 
 HTTPS 검사 기록의 `primary_seconds`·`secondary_seconds`는 이름 조회·TCP 연결·TLS 완료·전체 소요 시간(초)입니다. 완료되지 않은 단계는 0일 수 있어 종료 코드와 함께 해석합니다. 기존 사고 로그에는 DHCP·네트워크 전환·Tailscale 제어 연결 이벤트도 크기·시간 상한 안에서 포함합니다.
+
+재부팅 전후 네트워크 비교가 필요할 때 `"$HOME/Library/Application Support/MacLagMonitor/bin/mac-lag-monitorctl.sh" prepare-reboot`를 실행합니다. `data/network-reboot-before.txt`와 다음 부팅 시 한 번만 생성되는 `network-reboot-after.txt`를 비교합니다. 파일은 각각 최대 64KiB이며 다음 비교 때 갱신됩니다. 로그인 직후 기록은 네트워크·VPN 준비 전일 수 있습니다. 인터넷 검사 비활성화 설정을 존중하며 추가 상시 감시는 없습니다.

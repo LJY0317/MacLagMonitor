@@ -133,6 +133,50 @@ LOGICAL_CPU_COUNT="$(sysctl -n hw.logicalcpu_max 2>/dev/null || print 8)"
 
 timestamp() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 epoch_now() { date '+%s'; }
+boot_epoch() { sysctl -n kern.boottime 2>/dev/null | awk 'match($0,/sec = [0-9]+/){print substr($0,RSTART+6,RLENGTH-6)}'; }
+
+# Explicitly armed comparison only: two bounded files, no background probes.
+capture_network_reboot_reference() {
+  local phase="$1" reference_boot="$2" output="$DATA_DIR/network-reboot-${1}.txt"
+  local probe_file="$STATE_DIR/.network-reboot-probe.$$" target
+  {
+    print -r -- "captured=$(timestamp)"
+    print -r -- "phase=$phase reference_boot_epoch=$reference_boot current_boot_epoch=$(boot_epoch)"
+    print -r -- "scope=one-shot; early login may precede network or VPN readiness; no settings changed"
+    print -r -- "--- default route ---"
+    route -n get default 2>&1
+    print -r -- "route_exit=$?"
+    print -r -- "--- network interfaces ---"
+    /usr/sbin/scutil --nwi 2>&1 | head -n 50
+    print -r -- "--- resolver state ---"
+    /usr/sbin/scutil --dns | awk '/resolver #|nameserver\[|if_index|flags|reach/ {print; if (++n >= 80) exit}'
+    print -r -- "--- proxy flags ---"
+    /usr/sbin/scutil --proxy | awk '/Enable|Port/ {print; if (++n >= 16) exit}'
+    print -r -- "--- VPN counts ---"
+    /usr/sbin/scutil --nc list | awk '/\(Connected\)/ {connected++} /\(Connecting\)/ {connecting++} END {printf "connected=%d connecting=%d\n", connected, connecting}'
+    print -r -- "--- configured HTTPS probes: exit/http/dns/tcp/tls/total/remote_ip ---"
+    if (( INTERNET_CHECK_ENABLED == 1 )); then
+      for target in "$INTERNET_CHECK_PRIMARY_URL" "$INTERNET_CHECK_SECONDARY_URL"; do
+        run_https_probe "$target" "$probe_file"
+        cat "$probe_file"
+      done
+    else
+      print -r -- "probes=disabled"
+    fi
+  } | head -c 65536 >| "${output}.tmp"
+  mv -f -- "${output}.tmp" "$output" || return 1
+  rm -f -- "$probe_file"
+}
+
+capture_armed_network_reboot_reference() {
+  local marker="$STATE_DIR/network-reboot-reference.boot" current previous
+  [[ -f "$marker" ]] || return 0
+  previous="$(<"$marker")"
+  current="$(boot_epoch)"
+  [[ "$previous" == <-> && "$current" == <-> && "$current" != "$previous" ]] || return 0
+  capture_network_reboot_reference after "$previous" || return 1
+  rm -f -- "$marker"
+}
 
 log_message() {
   print -r -- "$(timestamp)"$'\t'"$*" >> "$SERVICE_LOG"
@@ -2084,7 +2128,7 @@ generate_reboot_postmortem() {
   local report_found=0 webkit_report_found=0 confidence="low" classification="unresolved" action
   local -a ranked
 
-  boot_epoch="$(sysctl -n kern.boottime 2>/dev/null | awk 'match($0,/sec = [0-9]+/){v=substr($0,RSTART+6,RLENGTH-6); print v}')"
+  boot_epoch="$(boot_epoch)"
   [[ "$boot_epoch" == <-> ]] || return
   [[ -f "$marker" && "$(<"$marker")" == "$boot_epoch" ]] && return
   boot_text="$(date -r "$boot_epoch" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || true)"
@@ -2405,6 +2449,7 @@ main_loop() {
   OWNS_PID_FILE=1
   mark_latest_incomplete_incident
   generate_reboot_postmortem
+  capture_armed_network_reboot_reference
   log_message "monitor-start pid=$$"
   while (( STOP_REQUESTED == 0 )); do
     power="$(current_power_mode)"
@@ -2435,8 +2480,15 @@ case "${1:-run}" in
     run_once
     run_incident_capture "manual-test"
     ;;
+  --prepare-network-reboot)
+    reference_boot="$(boot_epoch)"
+    [[ "$reference_boot" == <-> ]] || exit 1
+    capture_network_reboot_reference before "$reference_boot" || exit 1
+    print -r -- "$reference_boot" >| "$STATE_DIR/network-reboot-reference.boot"
+    print -r -- "Network reference saved; one comparison will be captured after the next boot."
+    ;;
   *)
-    print -u2 -- "Usage: $0 [run|--once|--force-incident]"
+    print -u2 -- "Usage: $0 [run|--once|--force-incident|--prepare-network-reboot]"
     exit 2
     ;;
 esac
