@@ -136,25 +136,32 @@ epoch_now() { date '+%s'; }
 boot_epoch() { sysctl -n kern.boottime 2>/dev/null | awk 'match($0,/sec = [0-9]+/){print substr($0,RSTART+6,RLENGTH-6)}'; }
 
 # Explicitly armed comparison only: two bounded files, no background probes.
-capture_network_reboot_reference() {
-  local phase="$1" reference_boot="$2" output="$DATA_DIR/network-reboot-${1}.txt"
+capture_network_context() {
+  print -r -- "--- default route ---"
+  route -n get default 2>&1
+  print -r -- "route_exit=$?"
+  print -r -- "--- IPv6 default route ---"
+  route -n get -inet6 default 2>&1
+  print -r -- "route6_exit=$?"
+  print -r -- "--- network interfaces ---"
+  /usr/sbin/scutil --nwi 2>&1 | head -n 50
+  print -r -- "--- resolver state ---"
+  /usr/sbin/scutil --dns | awk '/resolver #|nameserver\[|if_index|flags|reach/ {print; if (++n >= 80) exit}'
+  print -r -- "--- proxy flags ---"
+  /usr/sbin/scutil --proxy | awk '/Enable|Port/ {print; if (++n >= 16) exit}'
+  print -r -- "--- VPN counts ---"
+  /usr/sbin/scutil --nc list | awk '/\(Connected\)/ {connected++} /\(Connecting\)/ {connecting++} END {printf "connected=%d connecting=%d\n", connected, connecting}'
+}
+
+capture_network_reference() {
+  local phase="$1" reference_boot="$2" output="${3:-$DATA_DIR/network-reboot-${1}.txt}"
   local probe_file="$STATE_DIR/.network-reboot-probe.$$" target
   {
     print -r -- "captured=$(timestamp)"
     print -r -- "phase=$phase reference_boot_epoch=$reference_boot current_boot_epoch=$(boot_epoch)"
     print -r -- "scope=one-shot; early login may precede network or VPN readiness; no settings changed"
-    print -r -- "--- default route ---"
-    route -n get default 2>&1
-    print -r -- "route_exit=$?"
-    print -r -- "--- network interfaces ---"
-    /usr/sbin/scutil --nwi 2>&1 | head -n 50
-    print -r -- "--- resolver state ---"
-    /usr/sbin/scutil --dns | awk '/resolver #|nameserver\[|if_index|flags|reach/ {print; if (++n >= 80) exit}'
-    print -r -- "--- proxy flags ---"
-    /usr/sbin/scutil --proxy | awk '/Enable|Port/ {print; if (++n >= 16) exit}'
-    print -r -- "--- VPN counts ---"
-    /usr/sbin/scutil --nc list | awk '/\(Connected\)/ {connected++} /\(Connecting\)/ {connecting++} END {printf "connected=%d connecting=%d\n", connected, connecting}'
-    print -r -- "--- configured HTTPS probes: exit/http/dns/tcp/tls/total/remote_ip ---"
+    capture_network_context
+    print -r -- "--- configured HTTPS probes: exit/http/dns/tcp/tls/total/remote_ip/http_version/ssl_verify/redirects ---"
     if (( INTERNET_CHECK_ENABLED == 1 )); then
       for target in "$INTERNET_CHECK_PRIMARY_URL" "$INTERNET_CHECK_SECONDARY_URL"; do
         run_https_probe "$target" "$probe_file"
@@ -174,7 +181,7 @@ capture_armed_network_reboot_reference() {
   previous="$(<"$marker")"
   current="$(boot_epoch)"
   [[ "$previous" == <-> && "$current" == <-> && "$current" != "$previous" ]] || return 0
-  capture_network_reboot_reference after "$previous" || return 1
+  capture_network_reference after "$previous" || return 1
   rm -f -- "$marker"
 }
 
@@ -359,7 +366,7 @@ update_network_state_if_due() {
 run_https_probe() {
   local url="$1" output="$2" result curl_exit
   if [[ "$url" != https://* ]]; then
-    print -r -- $'90\t000\t0\t0\t0\t0\t-' >| "$output"
+    print -r -- $'90\t000\t0\t0\t0\t0\t-\t-\t-\t-' >| "$output"
     return
   fi
 
@@ -367,10 +374,10 @@ run_https_probe() {
     --connect-timeout "$INTERNET_CONNECT_TIMEOUT_SECONDS" \
     --max-time "$INTERNET_TOTAL_TIMEOUT_SECONDS" \
     --user-agent 'MacLagMonitor/1.1' \
-    --write-out $'%{http_code}\t%{time_namelookup}\t%{time_connect}\t%{time_appconnect}\t%{time_total}\t%{remote_ip}' \
+    --write-out $'%{http_code}\t%{time_namelookup}\t%{time_connect}\t%{time_appconnect}\t%{time_total}\t%{remote_ip}\t%{http_version}\t%{ssl_verify_result}\t%{num_redirects}' \
     "$url" 2>/dev/null)"
   curl_exit=$?
-  [[ -n "$result" ]] || result=$'000\t0\t0\t0\t0\t-'
+  [[ -n "$result" ]] || result=$'000\t0\t0\t0\t0\t-\t-\t-\t-'
   print -r -- "${curl_exit}"$'\t'"${result}" >| "$output"
 }
 
@@ -468,8 +475,8 @@ store_internet_probe_cache() {
 
 collect_internet_metrics() {
   local network_state="$1" primary_file secondary_file now
-  local p_exit=90 p_http=000 p_dns=0 p_connect=0 p_tls=0 p_total=0 p_ip=-
-  local s_exit=90 s_http=000 s_dns=0 s_connect=0 s_tls=0 s_total=0 s_ip=-
+  local p_exit=90 p_http=000 p_dns=0 p_connect=0 p_tls=0 p_total=0 p_ip=- p_version=- p_verify=- p_redirects=-
+  local s_exit=90 s_http=000 s_dns=0 s_connect=0 s_tls=0 s_total=0 s_ip=- s_version=- s_verify=- s_redirects=-
   local p_ok=0 s_ok=0 details
 
   INTERNET_STATE="disabled"
@@ -500,7 +507,7 @@ collect_internet_metrics() {
   secondary_file="$STATE_DIR/.internet-secondary.$$"
   run_https_probe "$INTERNET_CHECK_PRIMARY_URL" "$primary_file"
 
-  [[ -f "$primary_file" ]] && IFS=$'\t' read -r p_exit p_http p_dns p_connect p_tls p_total p_ip < "$primary_file"
+  [[ -f "$primary_file" ]] && IFS=$'\t' read -r p_exit p_http p_dns p_connect p_tls p_total p_ip p_version p_verify p_redirects < "$primary_file"
   rm -f -- "$primary_file"
   [[ "$p_exit" == <-> ]] || p_exit=90
   [[ "$p_http" == <-> ]] || p_http=000
@@ -508,7 +515,7 @@ collect_internet_metrics() {
 
   if (( p_ok == 0 )); then
     run_https_probe "$INTERNET_CHECK_SECONDARY_URL" "$secondary_file"
-    [[ -f "$secondary_file" ]] && IFS=$'\t' read -r s_exit s_http s_dns s_connect s_tls s_total s_ip < "$secondary_file"
+    [[ -f "$secondary_file" ]] && IFS=$'\t' read -r s_exit s_http s_dns s_connect s_tls s_total s_ip s_version s_verify s_redirects < "$secondary_file"
     rm -f -- "$secondary_file"
     [[ "$s_exit" == <-> ]] || s_exit=90
     [[ "$s_http" == <-> ]] || s_http=000
@@ -524,6 +531,8 @@ collect_internet_metrics() {
   # whether name lookup, TCP, TLS or the HTTP response stalled. No extra probes.
   details+=",primary_seconds=dns:${p_dns}/tcp:${p_connect}/tls:${p_tls}/total:${p_total}"
   (( p_ok == 0 )) && details+=",secondary_seconds=dns:${s_dns}/tcp:${s_connect}/tls:${s_tls}/total:${s_total}"
+  details+=",primary_peer=${p_ip}/http:${p_version}/verify:${p_verify}/redirects:${p_redirects}"
+  (( p_ok == 0 )) && details+=",secondary_peer=${s_ip}/http:${s_version}/verify:${s_verify}/redirects:${s_redirects}"
   INTERNET_PROBE_CODES="$details"
   if (( p_ok == 1 || s_ok == 1 )); then
     INTERNET_STATE="online"
@@ -577,16 +586,7 @@ capture_outage_path_diagnostics() {
   tcp_output="$(/usr/bin/nc -n -z -G 2 -w 2 1.1.1.1 443 2>&1)"
   tcp_exit=$?
   # Only structural resolver/routes/proxy/VPN state; no SSID, page data or VPN credentials.
-  network_context="$(
-    print -r -- '--- resolver state ---'
-    /usr/sbin/scutil --dns | awk '/resolver #|nameserver\[|if_index|flags|reach/ {print; if (++n >= 80) exit}'
-    print -r -- '--- network interfaces ---'
-    /usr/sbin/scutil --nwi | head -n 35
-    print -r -- '--- proxy flags ---'
-    /usr/sbin/scutil --proxy | awk '/Enable|Port/ {print; if (++n >= 16) exit}'
-    print -r -- '--- VPN counts ---'
-    /usr/sbin/scutil --nc list | awk '/\(Connected\)/ {connected++} /\(Connecting\)/ {connecting++} END {printf "connected=%d connecting=%d\n", connected, connecting}'
-  )"
+  network_context="$(capture_network_context)"
 
   (( gateway_exit == 0 )) && NETWORK_PATH_GATEWAY_STATUS="reachable" || NETWORK_PATH_GATEWAY_STATUS="unreachable"
   (( external_exit == 0 )) && NETWORK_PATH_EXTERNAL_STATUS="reachable" || NETWORK_PATH_EXTERNAL_STATUS="unreachable"
@@ -1701,10 +1701,14 @@ capture_recent_system_logs() {
   max_output=$(( SYSTEM_LOG_OUTPUT_MAX_MB * 1024 * 1024 ))
   started="$(epoch_now)"
 
+  local scope="${4:-system}" predicate='(eventMessage CONTAINS[c] "memory pressure" OR eventMessage CONTAINS[c] "jetsam" OR eventMessage CONTAINS[c] "network is unreachable" OR eventMessage CONTAINS[c] "invalid message" OR eventMessage CONTAINS[c] "EXC_GUARD" OR (process == "mediaanalysisd" AND (eventMessage CONTAINS[c] "MADService" OR eventMessage CONTAINS[c] "photos.textunderstanding" OR eventMessage CONTAINS[c] "background processing")) OR (process == "mobileassetd" AND (eventMessage CONTAINS[c] "requested purge-all" OR eventMessage CONTAINS[c] "Found no downloads" OR eventMessage CONTAINS[c] "download" OR eventMessage CONTAINS[c] "stale entry")) OR process == "replayd" OR process == "ReportCrash" OR process == "coresymbolicationd" OR (process == "configd" AND (eventMessage CONTAINS[c] "network changed:" OR (eventMessage CONTAINS[c] "DHCP " AND eventMessage CONTAINS[c] "status ="))) OR (process CONTAINS[c] "tailscale" AND (eventMessage CONTAINS[c] "setPaused(" OR eventMessage CONTAINS[c] "control: NetInfo:" OR eventMessage CONTAINS[c] "netmap: got new dial plan" OR eventMessage CONTAINS[c] "CreateEndpoint error" OR eventMessage CONTAINS[c] "ingress: denied")))'
+  # Keep crash-report noise from exhausting the existing budget before network events.
+  [[ "$scope" == "network" ]] && predicate='(eventMessage CONTAINS[c] "network is unreachable" OR (process == "configd" AND (eventMessage CONTAINS[c] "network changed:" OR (eventMessage CONTAINS[c] "DHCP " AND eventMessage CONTAINS[c] "status ="))) OR (process CONTAINS[c] "tailscale" AND (eventMessage CONTAINS[c] "setPaused(" OR eventMessage CONTAINS[c] "control: NetInfo:" OR eventMessage CONTAINS[c] "netmap: got new dial plan" OR eventMessage CONTAINS[c] "CreateEndpoint error" OR eventMessage CONTAINS[c] "ingress: denied")))'
+
   (
     ulimit -f $(( max_temp / 512 )) 2>/dev/null || true
     exec "$LOG_BIN" show --start "$start_text" --end "$end_text" --style compact --info \
-      --predicate '(eventMessage CONTAINS[c] "memory pressure" OR eventMessage CONTAINS[c] "jetsam" OR eventMessage CONTAINS[c] "network is unreachable" OR eventMessage CONTAINS[c] "invalid message" OR eventMessage CONTAINS[c] "EXC_GUARD" OR (process == "mediaanalysisd" AND (eventMessage CONTAINS[c] "MADService" OR eventMessage CONTAINS[c] "photos.textunderstanding" OR eventMessage CONTAINS[c] "background processing")) OR (process == "mobileassetd" AND (eventMessage CONTAINS[c] "requested purge-all" OR eventMessage CONTAINS[c] "Found no downloads" OR eventMessage CONTAINS[c] "download" OR eventMessage CONTAINS[c] "stale entry")) OR process == "replayd" OR process == "ReportCrash" OR process == "coresymbolicationd" OR (process == "configd" AND (eventMessage CONTAINS[c] "network changed:" OR (eventMessage CONTAINS[c] "DHCP " AND eventMessage CONTAINS[c] "status ="))) OR (process CONTAINS[c] "tailscale" AND (eventMessage CONTAINS[c] "setPaused(" OR eventMessage CONTAINS[c] "control: NetInfo:" OR eventMessage CONTAINS[c] "netmap: got new dial plan" OR eventMessage CONTAINS[c] "CreateEndpoint error" OR eventMessage CONTAINS[c] "ingress: denied")))'
+      --predicate "$predicate"
   ) >| "$temp" 2>/dev/null &
   LOG_CAPTURE_PID=$!
 
@@ -1743,6 +1747,7 @@ capture_recent_system_logs() {
   fi
   rm -f -- "$temp"
   {
+    print -r -- "scope=$scope"
     print -r -- "start=$start_text"
     print -r -- "end=$end_text"
     print -r -- "elapsed_seconds=$elapsed"
@@ -1762,7 +1767,10 @@ capture_recent_system_logs_if_relevant() {
   local output="$incident_dir/recent-system-events.log"
 
   case ",$trigger_reason," in
-    *",manual-test,"*|*",internet-down,"*|*",monitor-sample-stall,"*|*",memory-pressure,"*|*",compressor-high,"*|*",crashreporter-high,"*|*",coresymbolication-high,"*|*",webkit-cpu-high,"*|*",mediaanalysisd-high,"*|*",mobileassetd-high,"*|*",replayd-high,"*|*",system-load-high,"*)
+    *",internet-down,"*)
+      capture_recent_system_logs "$incident_dir" "$incident_start_epoch" "$incident_end_epoch" network
+      ;;
+    *",manual-test,"*|*",monitor-sample-stall,"*|*",memory-pressure,"*|*",compressor-high,"*|*",crashreporter-high,"*|*",coresymbolication-high,"*|*",webkit-cpu-high,"*|*",mediaanalysisd-high,"*|*",mobileassetd-high,"*|*",replayd-high,"*|*",system-load-high,"*)
       capture_recent_system_logs "$incident_dir" "$incident_start_epoch" "$incident_end_epoch"
       ;;
     *)
@@ -2480,15 +2488,19 @@ case "${1:-run}" in
     run_once
     run_incident_capture "manual-test"
     ;;
+  --network-diagnostic)
+    capture_network_reference manual "$(boot_epoch)" "$DATA_DIR/network-current.txt" || exit 1
+    print -r -- "$DATA_DIR/network-current.txt"
+    ;;
   --prepare-network-reboot)
     reference_boot="$(boot_epoch)"
     [[ "$reference_boot" == <-> ]] || exit 1
-    capture_network_reboot_reference before "$reference_boot" || exit 1
+    capture_network_reference before "$reference_boot" || exit 1
     print -r -- "$reference_boot" >| "$STATE_DIR/network-reboot-reference.boot"
     print -r -- "Network reference saved; one comparison will be captured after the next boot."
     ;;
   *)
-    print -u2 -- "Usage: $0 [run|--once|--force-incident|--prepare-network-reboot]"
+    print -u2 -- "Usage: $0 [run|--once|--force-incident|--network-diagnostic|--prepare-network-reboot]"
     exit 2
     ;;
 esac
