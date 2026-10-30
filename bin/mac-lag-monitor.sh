@@ -134,10 +134,31 @@ epoch_now() { date '+%s'; }
 boot_epoch() { sysctl -n kern.boottime 2>/dev/null | awk 'match($0,/sec = [0-9]+/){print substr($0,RSTART+6,RLENGTH-6)}'; }
 
 # Explicitly armed comparison only: two bounded files, no background probes.
+# Route lookups inspect the routing table; they do not send packets or resolve names.
+capture_destination_routes() {
+  local target peer
+  local -a targets
+  targets=(1.1.1.1)
+  for peer in ${(s:,:)${INTERNET_PROBE_CODES:-}}; do
+    [[ "$peer" == primary_peer=* || "$peer" == secondary_peer=* ]] || continue
+    target="${peer#*=}"; target="${target%%/*}"
+    [[ "$target" =~ '^[0-9a-fA-F:.]+$' ]] || continue
+    (( ${targets[(Ie)$target]} )) || targets+=("$target")
+  done
+  print -r -- "scope=current-routing-table; HTTPS peers may be cached; no app attribution"
+  for target in "${targets[@]}"; do
+    print -r -- "destination=$target"
+    route -n get "$target" 2>&1
+    print -r -- "lookup_exit=$?"
+  done
+}
+
 capture_network_context() {
   print -r -- "--- default route ---"
   route -n get default 2>&1
   print -r -- "route_exit=$?"
+  print -r -- "--- effective destination routes ---"
+  capture_destination_routes
   print -r -- "--- IPv6 default route ---"
   route -n get -inet6 default 2>&1
   print -r -- "route6_exit=$?"
@@ -337,12 +358,28 @@ choose_interval() {
 }
 
 update_network_state_if_due() {
-  local now last=0 network_status="unknown" route_status="no-route"
+  local now last=0 network_status="unknown" route_status="no-route" route_text route_key previous_route=""
+  local effective_route interface address before after
   now="$(epoch_now)"
   [[ -f "$STATE_DIR/network.last" ]] && last="$(<"$STATE_DIR/network.last")"
   [[ "$last" == <-> ]] || last=0
 
-  route -n get default >/dev/null 2>&1 && route_status="route-present"
+  route_text="$(route -n get default 2>/dev/null)" && route_status="route-present"
+  interface="$(print -r -- "$route_text" | awk '/interface:/ {print $2; exit}')"
+  address=""
+  [[ -n "$interface" ]] && address="$(/usr/sbin/ipconfig getifaddr "$interface" 2>/dev/null)"
+  effective_route="$(route -n get 1.1.1.1 2>/dev/null)"
+  route_key="default:$(print -r -- "$route_text" | awk '/gateway:|interface:/ {printf "%s=%s;",$1,$2}')address:${address:-none};effective:$(print -r -- "$effective_route" | awk '/gateway:|interface:/ {printf "%s=%s;",$1,$2}')"
+  [[ -f "$STATE_DIR/network.route" ]] && previous_route="$(<"$STATE_DIR/network.route")"
+  if [[ "$route_key" != "$previous_route" ]]; then
+    # Observe address and effective tunnel changes on the existing sample cadence.
+    # This is the observation time, not the exact OS network-change time.
+    ensure_network_events_header
+    before="${previous_route//$'\n'/;}"; after="${route_key//$'\n'/;}"
+    print -r -- "$(timestamp)"$'\t'"path-change"$'\tunknown\tunknown\t\t\t\t'"before=${before:-unknown},after=$after;scope=sampled-routing-state;app-state=unknown" >> "$NETWORK_EVENTS_FILE"
+    rm -f -- "$INTERNET_PROBE_CACHE_FILE"
+    print -r -- "$route_key" >| "$STATE_DIR/network.route"
+  fi
 
   if [[ "$route_status" == "no-route" ]]; then
     network_status="no-route"
@@ -376,7 +413,71 @@ run_https_probe() {
     "$url" 2>/dev/null)"
   curl_exit=$?
   [[ -n "$result" ]] || result=$'000\t0\t0\t0\t0\t-\t-\t-\t-'
+  # curl leaves remote_ip empty when resolution/connect fails. Normalize empty
+  # fields before shell read, whose whitespace IFS otherwise shifts later fields.
+  result="$(print -r -- "$result" | awk -F '\t' 'BEGIN {OFS="\t"} {for(i=1;i<=9;i++) if($i=="") $i="-"; print}')"
   print -r -- "${curl_exit}"$'\t'"${result}" >| "$output"
+}
+
+# Direct DNS queries deliberately bypass the system resolver policy. Compare
+# them with the original curl result; success here alone does not blame macOS.
+capture_dns_diagnostics() {
+  local incident_dir="$1" interface="$2" output="${3:-$1/dns-path-probe.tsv}"
+  local resolver_text servers host url server role query_type temp route_info
+  local index=0 pid
+  local -a hosts jobs temps
+  {
+    print -r -- "captured=$(timestamp)"
+    print -r -- "scope=one-shot-direct-DNS; compare with original system lookup; split-DNS policy is bypassed"
+    print -r -- "reference_limit=public DNS may be filtered; failure is not proof of a broken resolver"
+    print -r -- $'role\tserver\thost\ttype\tstatus\tdig_exit\tquery_ms\troute_interface'
+  } >| "$output"
+  (( INTERNET_CHECK_ENABLED == 1 )) || { print -r -- "probes=disabled" >> "$output"; return; }
+  [[ -x /usr/bin/dig ]] || { print -r -- "probes=unavailable-dig" >> "$output"; return; }
+  resolver_text="$(/usr/sbin/scutil --dns 2>/dev/null)"
+  # One scoped resolver for this interface and one supplemental resolver, plus
+  # one reference server: a fixed diagnostic query budget, not a log count cap.
+  servers="$(print -r -- "$resolver_text" | awk -v iface="$interface" '
+    function emit() {
+      if(scoped && device==iface && first!="" && !got_interface++) print "interface\t" first
+      if(!scoped && supplemental && first!="" && !got_supplemental++) print "supplemental\t" first
+    }
+    /^DNS configuration/ {emit(); first=""; device=""; supplemental=0; scoped=($0 ~ /scoped/); next}
+    /^resolver #/ {emit(); first=""; device=""; supplemental=0; next}
+    /nameserver\[/ && first=="" {first=$3}
+    /if_index/ {device=$4; gsub(/[()]/,"",device)}
+    /flags.*Supplemental/ {supplemental=1}
+    END {emit()}' )"
+  servers+=$'\nreference\t1.1.1.1'
+  hosts=()
+  for url in "$INTERNET_CHECK_PRIMARY_URL" "$INTERNET_CHECK_SECONDARY_URL"; do
+    host="${url#https://}"; host="${host%%/*}"; host="${host%%:*}"
+    [[ "$url" == https://* && "$host" =~ '^[A-Za-z0-9][A-Za-z0-9.-]*$' ]] || continue
+    (( ${hosts[(Ie)$host]} )) || hosts+=("$host")
+  done
+  jobs=(); temps=()
+  while IFS=$'\t' read -r role server; do
+    [[ -n "$server" ]] || continue
+    route_info="$(route -n get "$server" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+    for host in "${hosts[@]}"; do
+      (( index++ )); temp="$incident_dir/.dns-probe-${$}-${index}.tmp"; temps+=("$temp")
+      (
+        local answer="" code=0
+        for query_type in A AAAA; do
+          answer="$(/usr/bin/dig "@$server" "$host" "$query_type" +time=1 +tries=1 +noall +comments +stats 2>/dev/null)"
+          code=$?
+          print -r -- "$answer" | awk -v role="$role" -v server="$server" -v host="$host" -v type="$query_type" -v code="$code" -v iface="${route_info:-unknown}" '
+            BEGIN {status="no-response"; ms="unknown"}
+            /status:/ {for(i=1;i<=NF;i++) if($i=="status:") {status=$(i+1); sub(/,/,"",status)}}
+            /Query time:/ {ms=$4}
+            END {printf "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",role,server,host,type,status,code,ms,iface}'
+        done
+      ) >| "$temp" &
+      jobs+=("$!")
+    done
+  done <<< "$servers"
+  for pid in "${jobs[@]}"; do wait "$pid" 2>/dev/null || true; done
+  for temp in "${temps[@]}"; do cat "$temp" >> "$output"; rm -f -- "$temp"; done
 }
 
 network_events_header() {
@@ -509,7 +610,7 @@ collect_internet_metrics() {
   rm -f -- "$primary_file"
   [[ "$p_exit" == <-> ]] || p_exit=90
   [[ "$p_http" == <-> ]] || p_http=000
-  (( p_exit == 0 && p_http > 0 )) && p_ok=1
+  (( p_exit == 0 && p_http >= 200 && p_http < 400 )) && p_ok=1
 
   if (( p_ok == 0 )); then
     run_https_probe "$INTERNET_CHECK_SECONDARY_URL" "$secondary_file"
@@ -517,7 +618,7 @@ collect_internet_metrics() {
     rm -f -- "$secondary_file"
     [[ "$s_exit" == <-> ]] || s_exit=90
     [[ "$s_http" == <-> ]] || s_http=000
-    (( s_exit == 0 && s_http > 0 )) && s_ok=1
+    (( s_exit == 0 && s_http >= 200 && s_http < 400 )) && s_ok=1
   fi
 
   if (( p_ok == 1 )); then
@@ -543,6 +644,9 @@ collect_internet_metrics() {
   elif (( p_exit == 6 && s_exit == 6 )); then
     INTERNET_STATE="offline-dns"
     DNS_STATE="failed"
+  elif (( (p_exit == 0 && p_http >= 400) || (s_exit == 0 && s_http >= 400) )); then
+    INTERNET_STATE="offline-http"
+    DNS_STATE="resolved"
   else
     INTERNET_STATE="offline-connect"
     if awk -v a="$p_dns" -v b="$s_dns" 'BEGIN {exit !((a+0) > 0 || (b+0) > 0)}'; then
@@ -555,10 +659,22 @@ collect_internet_metrics() {
   store_internet_probe_cache "$now"
 }
 
-capture_outage_path_diagnostics() {
+capture_network_extensions() {
+  local output="$1" result code
+  result="$(/usr/bin/systemextensionsctl list 2>/dev/null)"
+  code=$?
+  {
+    print -r -- "captured=$(timestamp)"
+    print -r -- "command_exit=$code"
+    print -r -- "scope=OS-listed-network-system-extensions; app-based VPNs and filters may not appear here"
+    print -r -- "$result" | awk '/^---/ {network=($0 ~ /network_extension/)} network {print}' | head -c 16384
+  } >| "$output"
+}
+
+capture_network_path_diagnostics() {
   local incident_dir="$1" output
   output="$incident_dir/network-path-probe.txt"
-  local route_text gateway interface gateway_output external_output
+  local route_text gateway interface gateway_output external_output route_after started
   local tcp_exit=99 tcp_output network_context
   local gateway_exit=99 external_exit=99 load1 load_per_cpu load_high=0
   local classification="unresolved" interpretation=""
@@ -566,6 +682,7 @@ capture_outage_path_diagnostics() {
   NETWORK_PATH_CLASSIFICATION="unresolved"
   NETWORK_PATH_GATEWAY_STATUS="unknown"
   NETWORK_PATH_EXTERNAL_STATUS="unknown"
+  started="$(timestamp)"
   route_text="$(route -n get default 2>&1)"
   gateway="$(print -r -- "$route_text" | awk '/gateway:/{print $2; exit}')"
   interface="$(print -r -- "$route_text" | awk '/interface:/{print $2; exit}')"
@@ -573,6 +690,11 @@ capture_outage_path_diagnostics() {
   load_per_cpu="$(awk -v load="$load1" -v cpus="$LOGICAL_CPU_COUNT" 'BEGIN {if (cpus > 0) printf "%.2f", load / cpus; else print "0.00"}')"
   (( $(integer_value "$load1") >= LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD )) && load_high=1
 
+  if (( INTERNET_CHECK_ENABLED != 1 )); then
+    gateway_output="probes disabled"
+    external_output="probes disabled"
+    tcp_output="probes disabled"
+  else
   if [[ -n "$gateway" ]]; then
     gateway_output="$(/sbin/ping -n -q -c 3 -W 1000 "$gateway" 2>&1)"
     gateway_exit=$?
@@ -583,13 +705,28 @@ capture_outage_path_diagnostics() {
   external_exit=$?
   tcp_output="$(/usr/bin/nc -n -z -G 2 -w 2 1.1.1.1 443 2>&1)"
   tcp_exit=$?
+  fi
   # Only structural resolver/routes/proxy/VPN state; no SSID, page data or VPN credentials.
   network_context="$(capture_network_context)"
+  capture_dns_diagnostics "$incident_dir" "$interface"
+  capture_network_extensions "$incident_dir/network-extensions.txt"
+  route_after="$(route -n get default 2>/dev/null)"
 
-  (( gateway_exit == 0 )) && NETWORK_PATH_GATEWAY_STATUS="reachable" || NETWORK_PATH_GATEWAY_STATUS="unreachable"
-  (( external_exit == 0 )) && NETWORK_PATH_EXTERNAL_STATUS="reachable" || NETWORK_PATH_EXTERNAL_STATUS="unreachable"
+  if (( INTERNET_CHECK_ENABLED != 1 )); then
+    NETWORK_PATH_GATEWAY_STATUS="not-probed"
+    NETWORK_PATH_EXTERNAL_STATUS="not-probed"
+  else
+    (( gateway_exit == 0 )) && NETWORK_PATH_GATEWAY_STATUS="reachable" || NETWORK_PATH_GATEWAY_STATUS="unreachable"
+    (( external_exit == 0 )) && NETWORK_PATH_EXTERNAL_STATUS="reachable" || NETWORK_PATH_EXTERNAL_STATUS="unreachable"
+  fi
 
-  if [[ -z "$gateway" ]]; then
+  if [[ "${INTERNET_STATE:-unknown}" == "online" ]]; then
+    classification="currently-online"
+    interpretation="현재 HTTPS 검사는 성공함. 지금의 경로 상태로 이전 장애 원인을 판정할 수 없음"
+  elif [[ "${INTERNET_STATE:-unknown}" == "disabled" ]]; then
+    classification="internet-check-disabled"
+    interpretation="인터넷 검사가 비활성화됨; 로컬 경로 정보만 수집"
+  elif [[ -z "$gateway" ]]; then
     classification="local-route-missing"
     interpretation="기본 게이트웨이를 찾지 못해 로컬 네트워크 경로 문제 가능성이 큼"
   elif (( tcp_exit == 0 )) && [[ "${DNS_STATE:-unknown}" == "failed" ]]; then
@@ -602,14 +739,11 @@ capture_outage_path_diagnostics() {
     classification="local-link-or-icmp-filtering"
     interpretation="기본 게이트웨이 ICMP 응답 없음. 로컬 링크·필터 후보이며 ICMP 차단 가능성 때문에 원인 미확정"
   elif (( external_exit != 0 && tcp_exit != 0 )); then
-    classification="upstream-path-or-icmp-filtering"
-    interpretation="공유기는 응답하지만 외부 숫자 IP는 응답하지 않음. WAN/상위 경로 문제 가능성이 있으나 ICMP 차단 가능성도 있음"
+    classification="external-path-failure-cause-unresolved"
+    interpretation="공유기는 응답하지만 외부 IP의 ICMP·TCP 연결 실패. 실제 목적지 경로를 비교하며 로컬 VPN·필터와 공유기 이후 경로를 모두 후보로 유지; 원인 미확정"
   elif [[ "${DNS_STATE:-unknown}" == "failed" ]]; then
     classification="dns-resolution-failure"
     interpretation="공유기와 외부 숫자 IP는 도달 가능하지만 DNS가 실패해 이름 해석 경로를 우선 확인"
-  elif (( load_high == 1 )); then
-    classification="host-saturation-or-transport-contention"
-    interpretation="공유기와 외부 숫자 IP는 응답하지만 HTTPS 검사 실패와 높은 시스템 load가 겹침. 호스트 포화로 TCP/TLS 작업이 지연됐을 가능성이 큼"
   else
     classification="https-or-transport-specific-failure"
     interpretation="ICMP 경로는 살아 있으나 HTTPS 검사가 실패해 TCP/TLS/필터/원격 서비스 경로를 추가 확인"
@@ -618,6 +752,9 @@ capture_outage_path_diagnostics() {
 
   {
     print -r -- "captured=$(timestamp)"
+    print -r -- "capture_started=$started"
+    print -r -- "https_probe_recorded_epoch=$(awk -F '\t' 'NR==1 {print $1}' "$INTERNET_PROBE_CACHE_FILE" 2>/dev/null)"
+    print -r -- "default_route_changed_during_capture=$([[ "$(print -r -- "$route_text" | awk '/gateway:|interface:/')" == "$(print -r -- "$route_after" | awk '/gateway:|interface:/')" ]] && print no || print yes)"
     print -r -- "path_classification=$classification"
     print -r -- "interpretation=$interpretation"
     print -r -- "internet_state_at_trigger=${INTERNET_STATE:-unknown}"
@@ -634,7 +771,7 @@ capture_outage_path_diagnostics() {
     print -r -- "external_ping_status=$NETWORK_PATH_EXTERNAL_STATUS"
     print -r -- "external_numeric_tcp_target=1.1.1.1:443"
     print -r -- "external_tcp_exit=$tcp_exit"
-    print -r -- "diagnostic_scope=one-shot-at-outage-start; no network settings changed"
+    print -r -- "diagnostic_scope=one-shot; current observations do not establish past failures; no network settings changed"
     print -r -- "probe_limit=single external target; reachability does not identify root cause"
     print -r -- "$network_context"
     print -r -- ""
@@ -644,11 +781,52 @@ capture_outage_path_diagnostics() {
     print -r -- "$gateway_output"
     print -r -- "--- external numeric ping ---"
     print -r -- "$external_output"
+    print -r -- "--- external numeric TCP ---"
+    print -r -- "$tcp_output"
     if [[ -n "$interface" ]]; then
       print -r -- "--- interface counters ---"
       /usr/sbin/netstat -I "$interface" -b -d -n 2>&1 | head -n 4
     fi
   } >| "$output"
+}
+
+# The same incident can start with resource pressure and only later lose its
+# network. Capture the first observed failure and first recovery in that folder.
+capture_incident_network_changes() {
+  local incident_dir="$1" interface
+  if [[ "$INTERNET_STATE" == offline-* && ! -f "$incident_dir/network-path-probe.txt" ]]; then
+    capture_network_path_diagnostics "$incident_dir"
+    print -r -- "network_failure_observed=$(timestamp)" >> "$incident_dir/metadata.txt"
+    print -r -- "${incident_dir:t}" >| "$STATE_DIR/network-pending-incident"
+  elif [[ "$INTERNET_STATE" == online && -f "$incident_dir/network-path-probe.txt" && ! -f "$incident_dir/network-recovery-context.txt" ]]; then
+    {
+      print -r -- "captured=$(timestamp)"
+      print -r -- "internet_last_success=$INTERNET_LAST_SUCCESS"
+      print -r -- "internet_probe_codes=$INTERNET_PROBE_CODES"
+      print -r -- "scope=first-observed-recovery; not proof of lasting stability"
+      capture_network_context
+    } >| "$incident_dir/network-recovery-context.txt"
+    interface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+    capture_dns_diagnostics "$incident_dir" "$interface" "$incident_dir/dns-recovery-probe.tsv"
+    capture_network_extensions "$incident_dir/network-recovery-extensions.txt"
+    print -r -- "network_recovery_observed=$(timestamp)" >> "$incident_dir/metadata.txt"
+    rm -f -- "$STATE_DIR/network-pending-incident"
+  fi
+}
+
+capture_pending_network_recovery() {
+  local marker="$STATE_DIR/network-pending-incident" incident_id
+  [[ -f "$marker" ]] || return
+  incident_id="$(<"$marker")"
+  # Retention may have removed the folder. Never recreate expired evidence.
+  if [[ "$incident_id" != [0-9]* || "$incident_id" == */* || ! -d "$INCIDENTS_DIR/$incident_id" || "$INTERNET_STATE" == disabled ]]; then
+    rm -f -- "$marker"
+  elif [[ "$INTERNET_STATE" == online ]]; then
+    if [[ ! -f "$INCIDENTS_DIR/$incident_id/network-recovery-context.txt" ]]; then
+      capture_incident_network_changes "$INCIDENTS_DIR/$incident_id"
+    fi
+    rm -f -- "$marker"
+  fi
 }
 
 collect_vm_metrics() {
@@ -952,54 +1130,53 @@ determine_trigger_flags() {
   trigger_flags=()
 
   if [[ "${PROCESS_SNAPSHOT_STATUS:-unknown}" != "ok" ]]; then
-    CONTEXT_FLAGS="process-snapshot-${PROCESS_SNAPSHOT_STATUS:-unknown}"
-    TRIGGER_FLAGS=""
-    return
-  fi
+    context_flags+=("process-snapshot-${PROCESS_SNAPSHOT_STATUS:-unknown}")
+  else
 
-  # Context flags preserve the sensitive historical signals in summary.tsv.
-  is_number "$MEMORY_FREE_PERCENT" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= MEMORY_FREE_PERCENT_THRESHOLD )) && context_flags+=("memory-pressure")
-  (( $(integer_value "$COMPRESSOR_MB") >= COMPRESSOR_MB_THRESHOLD )) && context_flags+=("compressor-high")
-  (( $(integer_value "$SAFARI_GROUP_MB") >= SAFARI_GROUP_MB_THRESHOLD )) && context_flags+=("safari-high")
-  (( $(integer_value "$WEBKIT_MAX_MB") >= WEBKIT_PROCESS_MB_THRESHOLD )) && context_flags+=("webkit-process-high")
-  (( $(integer_value "$WINDOWSERVER_CPU") >= WINDOWSERVER_CPU_THRESHOLD )) && context_flags+=("windowserver-high")
-  (( $(integer_value "$WEBKIT_HOT_CPU") >= WEBKIT_CPU_SAMPLE_THRESHOLD )) && context_flags+=("webkit-cpu-high")
-  if [[ "$WATCH_PROCESS_HOT_CPU" != "disabled" ]] && (( $(integer_value "$WATCH_PROCESS_HOT_CPU") >= WATCH_PROCESS_CPU_THRESHOLD )); then
-    context_flags+=("watched-process-cpu-high")
-  fi
+    # Context flags preserve the sensitive historical signals in summary.tsv.
+    is_number "$MEMORY_FREE_PERCENT" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= MEMORY_FREE_PERCENT_THRESHOLD )) && context_flags+=("memory-pressure")
+    (( $(integer_value "$COMPRESSOR_MB") >= COMPRESSOR_MB_THRESHOLD )) && context_flags+=("compressor-high")
+    (( $(integer_value "$SAFARI_GROUP_MB") >= SAFARI_GROUP_MB_THRESHOLD )) && context_flags+=("safari-high")
+    (( $(integer_value "$WEBKIT_MAX_MB") >= WEBKIT_PROCESS_MB_THRESHOLD )) && context_flags+=("webkit-process-high")
+    (( $(integer_value "$WINDOWSERVER_CPU") >= WINDOWSERVER_CPU_THRESHOLD )) && context_flags+=("windowserver-high")
+    (( $(integer_value "$WEBKIT_HOT_CPU") >= WEBKIT_CPU_SAMPLE_THRESHOLD )) && context_flags+=("webkit-cpu-high")
+    if [[ "$WATCH_PROCESS_HOT_CPU" != "disabled" ]] && (( $(integer_value "$WATCH_PROCESS_HOT_CPU") >= WATCH_PROCESS_CPU_THRESHOLD )); then
+      context_flags+=("watched-process-cpu-high")
+    fi
 
-  # Incident thresholds are intentionally much stricter so routine heavy use is
-  # recorded as context without automatically starting a four-minute capture.
-  is_number "$MEMORY_FREE_PERCENT" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= INCIDENT_MEMORY_FREE_PERCENT_THRESHOLD )) && trigger_flags+=("memory-pressure")
-  (( $(integer_value "$COMPRESSOR_MB") >= INCIDENT_COMPRESSOR_MB_THRESHOLD )) && trigger_flags+=("compressor-high")
-  (( $(integer_value "$SAFARI_GROUP_MB") >= INCIDENT_SAFARI_GROUP_MB_THRESHOLD )) && trigger_flags+=("safari-high")
-  (( $(integer_value "$WEBKIT_MAX_MB") >= INCIDENT_WEBKIT_PROCESS_MB_THRESHOLD )) && trigger_flags+=("webkit-process-high")
-  (( $(integer_value "$WINDOWSERVER_CPU") >= INCIDENT_WINDOWSERVER_CPU_THRESHOLD )) && trigger_flags+=("windowserver-high")
-  (( $(integer_value "$WEBKIT_HOT_CPU") >= INCIDENT_WEBKIT_CPU_THRESHOLD )) && trigger_flags+=("webkit-cpu-high")
-  if (( $(integer_value "$REPORTCRASH_CPU") >= REPORTCRASH_CPU_THRESHOLD )); then
-    context_flags+=("crashreporter-high")
-    trigger_flags+=("crashreporter-high")
-  fi
-  if (( $(integer_value "$CORESYMBOLICATION_CPU") >= CORESYMBOLICATION_CPU_THRESHOLD )); then
-    context_flags+=("coresymbolication-high")
-    trigger_flags+=("coresymbolication-high")
-  fi
-  if (( $(integer_value "$MEDIAANALYSISD_CPU") >= MEDIAANALYSISD_CPU_THRESHOLD )); then
-    context_flags+=("mediaanalysisd-high")
-    trigger_flags+=("mediaanalysisd-high")
-  fi
-  if (( $(integer_value "$MOBILEASSETD_CPU") >= MOBILEASSETD_CPU_THRESHOLD )); then
-    context_flags+=("mobileassetd-high")
-    trigger_flags+=("mobileassetd-high")
-  fi
-  if (( $(integer_value "$REPLAYD_CPU") >= REPLAYD_CPU_THRESHOLD )); then
-    context_flags+=("replayd-high")
-    trigger_flags+=("replayd-high")
-  fi
-  (( $(integer_value "${LOAD_1M:-0}") >= LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD )) && load_high=1
-  if (( load_high == 1 )); then
-    context_flags+=("system-load-high")
-    trigger_flags+=("system-load-high")
+    # Incident thresholds are intentionally much stricter so routine heavy use is
+    # recorded as context without automatically starting a four-minute capture.
+    is_number "$MEMORY_FREE_PERCENT" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= INCIDENT_MEMORY_FREE_PERCENT_THRESHOLD )) && trigger_flags+=("memory-pressure")
+    (( $(integer_value "$COMPRESSOR_MB") >= INCIDENT_COMPRESSOR_MB_THRESHOLD )) && trigger_flags+=("compressor-high")
+    (( $(integer_value "$SAFARI_GROUP_MB") >= INCIDENT_SAFARI_GROUP_MB_THRESHOLD )) && trigger_flags+=("safari-high")
+    (( $(integer_value "$WEBKIT_MAX_MB") >= INCIDENT_WEBKIT_PROCESS_MB_THRESHOLD )) && trigger_flags+=("webkit-process-high")
+    (( $(integer_value "$WINDOWSERVER_CPU") >= INCIDENT_WINDOWSERVER_CPU_THRESHOLD )) && trigger_flags+=("windowserver-high")
+    (( $(integer_value "$WEBKIT_HOT_CPU") >= INCIDENT_WEBKIT_CPU_THRESHOLD )) && trigger_flags+=("webkit-cpu-high")
+    if (( $(integer_value "$REPORTCRASH_CPU") >= REPORTCRASH_CPU_THRESHOLD )); then
+      context_flags+=("crashreporter-high")
+      trigger_flags+=("crashreporter-high")
+    fi
+    if (( $(integer_value "$CORESYMBOLICATION_CPU") >= CORESYMBOLICATION_CPU_THRESHOLD )); then
+      context_flags+=("coresymbolication-high")
+      trigger_flags+=("coresymbolication-high")
+    fi
+    if (( $(integer_value "$MEDIAANALYSISD_CPU") >= MEDIAANALYSISD_CPU_THRESHOLD )); then
+      context_flags+=("mediaanalysisd-high")
+      trigger_flags+=("mediaanalysisd-high")
+    fi
+    if (( $(integer_value "$MOBILEASSETD_CPU") >= MOBILEASSETD_CPU_THRESHOLD )); then
+      context_flags+=("mobileassetd-high")
+      trigger_flags+=("mobileassetd-high")
+    fi
+    if (( $(integer_value "$REPLAYD_CPU") >= REPLAYD_CPU_THRESHOLD )); then
+      context_flags+=("replayd-high")
+      trigger_flags+=("replayd-high")
+    fi
+    (( $(integer_value "${LOAD_1M:-0}") >= LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD )) && load_high=1
+    if (( load_high == 1 )); then
+      context_flags+=("system-load-high")
+      trigger_flags+=("system-load-high")
+    fi
   fi
   if (( INTERNET_OUTAGE_NEW == 1 )); then
     context_flags+=("internet-down")
@@ -1539,6 +1716,11 @@ rotate_storage() {
       trim_file_to_bytes "$file" $(( LAUNCHD_LOG_SIZE_LIMIT_MB * 512 * 1024 ))
     fi
   done
+  if [[ -f "$NETWORK_EVENTS_FILE" ]]; then
+    local event_cutoff="$(date -v-"${RETENTION_DAYS}"d '+%Y-%m-%dT%H:%M:%S%z')"
+    awk -F '\t' -v cutoff="$event_cutoff" 'NR==1 || $1 >= cutoff' "$NETWORK_EVENTS_FILE" >| "$NETWORK_EVENTS_FILE.trim.$$"
+    mv -f -- "$NETWORK_EVENTS_FILE.trim.$$" "$NETWORK_EVENTS_FILE"
+  fi
   if [[ -f "$NETWORK_EVENTS_FILE" ]] && (( $(stat -f '%z' "$NETWORK_EVENTS_FILE" 2>/dev/null || print 0) > 5242880 )); then
     trim_network_events_to_bytes 3145728
   fi
@@ -1620,8 +1802,7 @@ capture_detailed_state() {
     pmset -g batt 2>&1
     pmset -g therm 2>&1
     print -r -- "--- network path ---"
-    scutil --nwi 2>&1
-    route -n get default 2>&1
+    capture_network_context
     print -r -- "--- internet monitor state ---"
     print -r -- "internet_state: ${INTERNET_STATE:-unknown}"
     print -r -- "dns_state: ${DNS_STATE:-unknown}"
@@ -1631,8 +1812,7 @@ capture_detailed_state() {
     print -r -- "outage_started: ${INTERNET_OUTAGE_STARTED:-unknown}"
     print -r -- "--- disk ---"
     df -h /System/Volumes/Data 2>&1
-    print -r -- "--- nfcd launch state ---"
-    launchctl print system/com.apple.nfcd 2>&1 | head -n 80
+    print -r -- "thermal_scope=pmset-reported-warnings; fan RPM and temperature are not measured"
   } >| "$detail"
 
   if (( SAFARI_PID > 0 )) && \
@@ -1669,9 +1849,58 @@ capture_hot_webkit_sample() {
   return 0
 }
 
+# Export only event categories and numeric link metrics. Repeated messages are
+# coalesced; SSIDs, addresses, keychain identifiers and log bodies stay out.
+summarize_system_logs() {
+  awk '
+    function event(name, ts, key) {
+      key=name SUBSEP substr(ts,1,16)
+      label[key]=name; count[key]++; if (!(key in first)) first[key]=ts; last[key]=ts
+      return key
+    }
+    function metric(name, text, ts,    rest,v,key) {
+      if (match(text, "(^| )" name "=-?[0-9]+(\\.[0-9]+)?")) {
+        rest=substr(text,RSTART,RLENGTH); sub(/^.*=/,"",rest); v=rest+0
+        key=event("wifi_" name,ts)
+        if (count[key]==1 || v<low[key]) low[key]=v
+        if (count[key]==1 || v>high[key]) high[key]=v
+      }
+    }
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] / {
+      ts=$1 "T" $2; text=tolower($0)
+      if (text ~ /airportd/) {
+        if (text ~ /failed to talk to secd/) event("wifi_security_service_communication_failed",ts)
+        if (text ~ /scan failed/) event("wifi_scan_failed",ts)
+        if (text ~ /link down/) event("wifi_link_down",ts)
+        if (text ~ /disassociated|deauth/) event("wifi_disconnect_observed",ts)
+        if (text ~ /association failed|join failed/) event("wifi_join_failed",ts)
+        if (text ~ /lqm:/) {
+          n=split("rssi noise snr cca interferenceTotal txRate txFrames txFail txRetrans rxRetryFrames beaconRecv beaconSched",names," ")
+          for (i=1;i<=n;i++) metric(names[i],$0,ts)
+        }
+      } else if (text ~ /configd/) {
+        if (text ~ /network changed:/) event("network_configuration_changed",ts)
+        if (text ~ /dhcp.*status =/) event("dhcp_status_changed",ts)
+      } else if (text ~ /bcmwlan/) {
+        if (text ~ /trap|reset|fatal/) event("wifi_driver_reset_or_fault",ts)
+      } else if (text ~ /mdnsresponder/) event("system_resolver_error_or_fault",ts)
+      else if (text ~ /nesessionmanager|neagent|nehelper/) event("network_extension_error_or_fault",ts)
+      else if (text ~ /memory pressure|jetsam/) event("memory_pressure_event",ts)
+      else if (text ~ /mediaanalysisd/) event("mediaanalysis_event",ts)
+      else if (text ~ /mobileassetd/) event("mobileasset_event",ts)
+      else if (text ~ /replayd/) event("replay_event",ts)
+      else if (text ~ /reportcrash|coresymbolicationd/) event("crash_reporting_event",ts)
+      else if (text ~ /thermal|temperature|throttl/) event("thermal_event",ts)
+    }
+    END {
+      print "event\tcount\tfirst_observed\tlast_observed\tmin\tmax"
+      for (key in count) printf "%s\t%d\t%s\t%s\t%s\t%s\n",label[key],count[key],first[key],last[key],(key in low ? low[key] : "unknown"),(key in high ? high[key] : "unknown")
+    }'
+}
+
 capture_recent_system_logs() {
   local incident_dir="$1" incident_start_epoch="$2" incident_end_epoch="$3"
-  local output temp status_file start_text end_text started now elapsed size max_temp max_output reason="completed"
+  local output temp status_file start_text end_text started now elapsed size max_temp max_output reason="completed" command_exit=0
   output="$incident_dir/recent-system-events.log"
   temp="$incident_dir/.system-log.tmp"
   status_file="$incident_dir/system-log-capture-status.txt"
@@ -1681,9 +1910,14 @@ capture_recent_system_logs() {
   max_output=$(( SYSTEM_LOG_OUTPUT_MAX_MB * 1024 * 1024 ))
   started="$(epoch_now)"
 
-  local scope="${4:-system}" predicate='(eventMessage CONTAINS[c] "memory pressure" OR eventMessage CONTAINS[c] "jetsam" OR eventMessage CONTAINS[c] "network is unreachable" OR eventMessage CONTAINS[c] "invalid message" OR eventMessage CONTAINS[c] "EXC_GUARD" OR (process == "mediaanalysisd" AND (eventMessage CONTAINS[c] "MADService" OR eventMessage CONTAINS[c] "photos.textunderstanding" OR eventMessage CONTAINS[c] "background processing")) OR (process == "mobileassetd" AND (eventMessage CONTAINS[c] "requested purge-all" OR eventMessage CONTAINS[c] "Found no downloads" OR eventMessage CONTAINS[c] "download" OR eventMessage CONTAINS[c] "stale entry")) OR process == "replayd" OR process == "ReportCrash" OR process == "coresymbolicationd" OR (process == "configd" AND (eventMessage CONTAINS[c] "network changed:" OR (eventMessage CONTAINS[c] "DHCP " AND eventMessage CONTAINS[c] "status ="))) OR (process CONTAINS[c] "tailscale" AND (eventMessage CONTAINS[c] "setPaused(" OR eventMessage CONTAINS[c] "control: NetInfo:" OR eventMessage CONTAINS[c] "netmap: got new dial plan" OR eventMessage CONTAINS[c] "CreateEndpoint error" OR eventMessage CONTAINS[c] "ingress: denied")))'
-  # Keep crash-report noise from exhausting the existing budget before network events.
-  [[ "$scope" == "network" ]] && predicate='(eventMessage CONTAINS[c] "network is unreachable" OR (process == "configd" AND (eventMessage CONTAINS[c] "network changed:" OR (eventMessage CONTAINS[c] "DHCP " AND eventMessage CONTAINS[c] "status ="))) OR (process CONTAINS[c] "tailscale" AND (eventMessage CONTAINS[c] "setPaused(" OR eventMessage CONTAINS[c] "control: NetInfo:" OR eventMessage CONTAINS[c] "netmap: got new dial plan" OR eventMessage CONTAINS[c] "CreateEndpoint error" OR eventMessage CONTAINS[c] "ingress: denied")))'
+  # Process-scoped predicates avoid searching every unrelated system message.
+  # Network evidence is also retained during performance incidents: a cached
+  # successful HTTPS probe does not prove that Wi-Fi stayed healthy throughout.
+  local scope="${4:-system}" predicate
+  predicate='((process == "airportd" AND (eventMessage CONTAINS[c] "Failed to talk to secd" OR eventMessage CONTAINS[c] "Scan Failed" OR eventMessage CONTAINS[c] "link down" OR eventMessage CONTAINS[c] "disassociated" OR eventMessage CONTAINS[c] "deauth" OR eventMessage CONTAINS[c] "association failed" OR eventMessage CONTAINS[c] "join failed" OR eventMessage CONTAINS[c] "LQM:")) OR (process == "configd" AND (eventMessage CONTAINS[c] "network changed:" OR (eventMessage CONTAINS[c] "DHCP " AND eventMessage CONTAINS[c] "status ="))) OR (process CONTAINS[c] "BCMWLAN" AND (eventMessage CONTAINS[c] "trap" OR eventMessage CONTAINS[c] "reset" OR eventMessage CONTAINS[c] "fatal")) OR ((process == "mDNSResponder" OR process == "nesessionmanager" OR process == "neagent" OR process == "nehelper") AND (messageType == error OR messageType == fault)))'
+  if [[ "$scope" != "network" ]]; then
+    predicate="($predicate OR (process == \"mediaanalysisd\" AND (eventMessage CONTAINS[c] \"MADService\" OR eventMessage CONTAINS[c] \"background processing\")) OR (process == \"mobileassetd\" AND (eventMessage CONTAINS[c] \"download\" OR eventMessage CONTAINS[c] \"purge-all\")) OR process == \"replayd\" OR process == \"ReportCrash\" OR process == \"coresymbolicationd\" OR process == \"thermalmonitord\" OR (process == \"kernel\" AND (eventMessage CONTAINS[c] \"memory pressure\" OR eventMessage CONTAINS[c] \"jetsam\" OR eventMessage CONTAINS[c] \"thermal\")))"
+  fi
 
   (
     ulimit -f $(( max_temp / 512 )) 2>/dev/null || true
@@ -1712,19 +1946,18 @@ capture_recent_system_logs() {
     fi
     sleep 1
   done
-  wait "$LOG_CAPTURE_PID" 2>/dev/null || true
+  wait "$LOG_CAPTURE_PID" 2>/dev/null || command_exit=$?
   LOG_CAPTURE_PID=0
   elapsed=$(( $(epoch_now) - started ))
   size="$(stat -f '%z' "$temp" 2>/dev/null || print 0)"
   if [[ "$reason" == "completed" ]] && (( size >= max_temp )); then
     reason="size-limit"
+  elif [[ "$reason" == "completed" ]] && (( command_exit != 0 )); then
+    reason="command-error"
   fi
 
-  if (( size > max_output )); then
-    { print -r -- "[earlier log lines removed by ${SYSTEM_LOG_OUTPUT_MAX_MB}MB output cap]"; tail -c "$max_output" "$temp" | sed '1d'; } >| "$output"
-  else
-    cp -f -- "$temp" "$output" 2>/dev/null || : >| "$output"
-  fi
+  summarize_system_logs < "$temp" >| "$output"
+  (( $(stat -f '%z' "$output" 2>/dev/null || print 0) > max_output )) && trim_file_to_bytes "$output" "$max_output"
   rm -f -- "$temp"
   {
     print -r -- "scope=$scope"
@@ -1732,6 +1965,10 @@ capture_recent_system_logs() {
     print -r -- "end=$end_text"
     print -r -- "elapsed_seconds=$elapsed"
     print -r -- "completion=$reason"
+    print -r -- "command_exit=$command_exit"
+    print -r -- "evidence_scope=matched-events-only; missing or partial logs do not prove absence of a fault"
+    print -r -- "format=coalesced-event-categories-and-numeric-metrics; no raw log bodies"
+    print -r -- "count_scope=matching-log-records-per-minute; multiple records may describe one failure"
     print -r -- "temporary_bytes=$size"
     print -r -- "output_bytes=$(stat -f '%z' "$output" 2>/dev/null || print 0)"
     print -r -- "timeout_seconds=$SYSTEM_LOG_CAPTURE_TIMEOUT_SECONDS"
@@ -1746,12 +1983,15 @@ capture_recent_system_logs_if_relevant() {
   local status_file="$incident_dir/system-log-capture-status.txt"
   local output="$incident_dir/recent-system-events.log"
 
+  # A network failure may have started after a different incident trigger.
+  [[ -f "$incident_dir/network-path-probe.txt" ]] && trigger_reason+=",internet-down"
+
   case ",$trigger_reason," in
-    *",internet-down,"*)
-      capture_recent_system_logs "$incident_dir" "$incident_start_epoch" "$incident_end_epoch" network
-      ;;
     *",manual-test,"*|*",monitor-sample-stall,"*|*",memory-pressure,"*|*",compressor-high,"*|*",crashreporter-high,"*|*",coresymbolication-high,"*|*",webkit-cpu-high,"*|*",mediaanalysisd-high,"*|*",mobileassetd-high,"*|*",replayd-high,"*|*",system-load-high,"*)
       capture_recent_system_logs "$incident_dir" "$incident_start_epoch" "$incident_end_epoch"
+      ;;
+    *",internet-down,"*)
+      capture_recent_system_logs "$incident_dir" "$incident_start_epoch" "$incident_end_epoch" network
       ;;
     *)
       : >| "$output"
@@ -1924,7 +2164,8 @@ generate_incident_diagnosis() {
   local min_free max_compressor max_swap max_load max_safari max_webkit max_ws max_report max_symbol max_content_filter max_webkit_count offline_seen
   local max_webkit_hot hot_pid max_mediaanalysis max_mobileasset max_replay factor_count=0 primary="unresolved"
   local webkit_factor=0 background_factor=0 memory_factor=0 display_factor=0 network_factor=0 load_factor=0 classification
-  local network_path_classification="not-captured"
+  local network_path_classification="not-captured" network_samples=0 resource_metrics_status="available"
+  local process_peak peak_pid="unknown" peak_cpu="unknown" peak_rss="unknown" peak_at="unknown" peak_executable="unknown" cpu_factor=0
   timeline="$incident_dir/timeline.tsv"
   output="$incident_dir/diagnosis.txt"
   metrics="$(awk -F '\t' '
@@ -1952,18 +2193,44 @@ NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
       if ((value("mediaanalysisd_cpu_pct")+0) > mediaanalysis) mediaanalysis=value("mediaanalysisd_cpu_pct")+0
       if ((value("mobileassetd_cpu_pct")+0) > mobileasset) mobileasset=value("mobileassetd_cpu_pct")+0
       if ((value("replayd_cpu_pct")+0) > replay) replay=value("replayd_cpu_pct")+0
-      if (value("internet_state") != "online" && value("internet_state") != "disabled") offline=1
     }
-    END {if (valid == 0) {print "unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown"; exit} if (minfree == "") minfree="unknown"; printf "%s %.1f %.1f %.2f %.1f %.1f %.1f %.1f %.1f %.1f %.0f %d %.1f %d %.1f %.1f %.1f\n", minfree,comp,swap,load,safari,webkit,ws,report,symbol,content_filter,wc,offline,webkit_hot,hot_pid,mediaanalysis,mobileasset,replay}
+    END {if (valid == 0) {print "unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown"; exit} if (minfree == "") minfree="unknown"; printf "%s %.1f %.1f %.2f %.1f %.1f %.1f %.1f %.1f %.1f %.0f %.1f %d %.1f %.1f %.1f\n", minfree,comp,swap,load,safari,webkit,ws,report,symbol,content_filter,wc,webkit_hot,hot_pid,mediaanalysis,mobileasset,replay}
   ' "$timeline" 2>/dev/null)"
-  read -r min_free max_compressor max_swap max_load max_safari max_webkit max_ws max_report max_symbol max_content_filter max_webkit_count offline_seen max_webkit_hot hot_pid max_mediaanalysis max_mobileasset max_replay <<< "${metrics:-unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown}"
+  read -r min_free max_compressor max_swap max_load max_safari max_webkit max_ws max_report max_symbol max_content_filter max_webkit_count max_webkit_hot hot_pid max_mediaanalysis max_mobileasset max_replay <<< "${metrics:-unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown}"
+  # Network observations remain useful when process sampling is unavailable.
+  read -r network_samples offline_seen <<< "$(awk -F '\t' '
+    NR==1 {columns=NF; for(i=1;i<=NF;i++) c[$i]=i; next}
+    NF==columns && c["timestamp"] && c["internet_state"] {
+      state=$(c["internet_state"])
+      if($(c["timestamp"])!="" && (state=="online" || state=="disabled" || state ~ /^offline-/)) {
+        valid++; if(state ~ /^offline-/) offline=1
+      }
+    }
+    END {print valid+0, offline+0}' "$timeline")"
   if [[ "$min_free" == "unknown" ]]; then
-    print -r -- "진단 근거 부족: 유효한 timeline 표본이 없습니다 (빈/실패/부분 수집은 정상 수치로 집계하지 않음)." >| "$incident_dir/diagnosis.txt"
-    return 1
+    resource_metrics_status="unavailable"
+    if (( network_samples == 0 )); then
+      print -r -- "진단 근거 부족: 유효한 timeline 표본이 없습니다 (빈/실패/부분 수집은 정상 수치로 집계하지 않음)." >| "$incident_dir/diagnosis.txt"
+      return 1
+    fi
   fi
   if [[ -f "$incident_dir/network-path-probe.txt" ]]; then
     network_path_classification="$(awk -F= '$1 == "path_classification" {print substr($0, index($0, "=") + 1); exit}' "$incident_dir/network-path-probe.txt" 2>/dev/null)"
     [[ -n "$network_path_classification" ]] || network_path_classification="unresolved"
+  fi
+  # General CPU evidence comes from the already-recorded ps samples. A busy
+  # compiler must not disappear merely because it is not a Safari/background app.
+  if [[ -f "$incident_dir/process-context.tsv" ]]; then
+    process_peak="$(awk -F '\t' '
+      NR==1 {columns=NF; for(i=1;i<=NF;i++) c[$i]=i; next}
+      NF==columns && c["cpu_pct"] && c["pid"] && c["rss_kb"] && c["captured_at"] && c["executable"] {
+        cpu=$(c["cpu_pct"]); pid=$(c["pid"]); rss=$(c["rss_kb"])
+        if(cpu !~ /^[0-9]+(\.[0-9]+)?$/ || pid !~ /^[0-9]+$/ || rss !~ /^[0-9]+$/) next
+        if(!found || cpu+0>peak) {found=1; peak=cpu+0; record=pid "\t" cpu "\t" rss "\t" $(c["captured_at"]) "\t" $(c["executable"])}
+      }
+      END {if(found) print record}
+    ' "$incident_dir/process-context.tsv")"
+    [[ -n "$process_peak" ]] && IFS=$'\t' read -r peak_pid peak_cpu peak_rss peak_at peak_executable <<< "$process_peak"
   fi
 
   if (( $(integer_value "$max_webkit_hot") >= WEBKIT_CPU_SAMPLE_THRESHOLD || $(integer_value "$max_safari") >= SAFARI_GROUP_MB_THRESHOLD )); then
@@ -1996,12 +2263,16 @@ NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
     (( factor_count++ ))
     [[ "$primary" == "unresolved" ]] && primary="general-network-or-dns-problem"
   fi
-  if [[ ",$reason," == *",internet-down,"* && "$network_path_classification" == "host-saturation-or-transport-contention" ]] && (( load_factor == 1 && network_factor == 1 )); then
-    primary="probable-host-saturation-affecting-network"
-    classification="probable-host-saturation-affecting-network"
-  elif [[ ",$reason," == *",internet-down,"* ]] && (( network_factor == 1 )); then
+  if is_number "$peak_cpu" && (( $(integer_value "$peak_cpu") >= 100 && $(integer_value "$peak_cpu") > $(integer_value "$max_ws") && $(integer_value "$peak_cpu") > $(integer_value "$max_webkit_hot") )); then
+    cpu_factor=1
+    (( factor_count++ ))
+    primary="observed-cpu-heavy-process"
+  fi
+  if (( network_factor == 1 )); then
     primary="general-network-or-dns-problem"
     classification="network-failure-with-unproven-cause"
+  elif (( cpu_factor == 1 )); then
+    classification="observed-cpu-heavy-process"
   elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
     primary="probable-webkit-content-runaway"
     classification="probable-webkit-content-runaway"
@@ -2019,16 +2290,28 @@ NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
     print -r -- ""
     print -r -- "classification=$classification"
     print -r -- "primary_suspect=$primary"
-    if [[ "$classification" == "probable-host-saturation-affecting-network" ]]; then
-      print -r -- "confidence=medium-high"
-    elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
+    if (( network_factor == 1 )); then
+      print -r -- "confidence=low"
+    elif (( MACOS_WEBKIT_RESOURCE_FOUND == 1 && cpu_factor == 0 )); then
       print -r -- "confidence=high"
     elif (( MACOS_RESOURCE_FOUND == 1 )); then
       print -r -- "confidence=medium-high"
     else
       print -r -- "confidence=$([[ "$primary" == "unresolved" ]] && print low || print medium)"
     fi
-    print -r -- "contributors=safari_webkit:${webkit_factor},macos_background:${background_factor},memory:${memory_factor},windowserver:${display_factor},system_load:${load_factor},network:${network_factor}"
+    print -r -- "contributors=general_cpu:${cpu_factor},safari_webkit:${webkit_factor},macos_background:${background_factor},memory:${memory_factor},windowserver:${display_factor},system_load:${load_factor},network:${network_factor}"
+    print -r -- "observed_process_peak_pid=$peak_pid"
+    print -r -- "observed_process_peak_cpu_pct=$peak_cpu"
+    print -r -- "observed_process_peak_rss_kb=$peak_rss"
+    print -r -- "observed_process_peak_at=$peak_at"
+    print -r -- "observed_process_peak_executable=$peak_executable"
+    print -r -- "process_peak_scope=one observed ps sample; CPU percent is per logical core; not proof of network causation"
+    print -r -- "internet_probe_scope=cached between probes; short or destination-specific failures can be missed"
+    if [[ -f "$incident_dir/system-log-capture-status.txt" ]]; then
+      print -r -- "system_log_completion=$(awk -F= '$1=="completion" {print $2; exit}' "$incident_dir/system-log-capture-status.txt")"
+    fi
+    print -r -- "resource_metrics_status=$resource_metrics_status"
+    print -r -- "network_valid_sample_count=$network_samples"
     print -r -- "network_path_classification=$network_path_classification"
     print -r -- "direct_pid_domain_match_found=$PID_DOMAIN_MATCH_FOUND"
     if (( PID_DOMAIN_MATCH_FOUND == 1 )); then
@@ -2056,10 +2339,10 @@ NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
       print -r -- "macos_resource_footprint=$MACOS_RESOURCE_FOOTPRINT"
       print -r -- "macos_resource_stack_hint=$MACOS_RESOURCE_STACK_HINT"
     fi
-    if [[ "$classification" == "probable-host-saturation-affecting-network" ]]; then
-      print -r -- "recommended_action=공유기와 외부 숫자 IP가 응답하는 동안 HTTPS 실패와 높은 시스템 load가 겹침. top CPU 프로세스 수를 줄이거나 동시 작업 수를 낮춘 뒤 같은 네트워크에서 재현 여부를 비교"
-    elif [[ "$classification" == "network-failure-with-unproven-cause" ]]; then
+    if [[ "$classification" == "network-failure-with-unproven-cause" ]]; then
       print -r -- "recommended_action=network-path-probe.txt의 DNS·TCP·기본 경로·VPN 증거를 비교. 동시 CPU 활동은 별도 관측이며 인터넷 장애 원인으로 확정하지 않음"
+    elif (( cpu_factor == 1 )); then
+      print -r -- "recommended_action=process-context.tsv의 peak 시점 PID·실행 파일과 같은 표본의 부모 관계를 확인. 해당 작업 종료 전후 부하를 비교; 팬 회전수·온도·인터넷 장애의 직접 원인은 별도 증거 필요"
     elif (( PID_DOMAIN_MATCH_FOUND == 1 && MACOS_WEBKIT_RESOURCE_FOUND == 1 )); then
       print -r -- "recommended_action=macOS WebKit resource PID $PID_DOMAIN_MATCH_PID가 사고 시 Safari 도메인 '$PID_DOMAIN_MATCH_DOMAIN'과 직접 매핑됨. 이 도메인 탭부터 격리해 재현 여부를 확인하되 iframe·worker Site Isolation 가능성 때문에 단독 인과 증거로 보지는 말 것"
     elif (( PID_DOMAIN_MATCH_FOUND == 1 )); then
@@ -2297,18 +2580,16 @@ run_incident_capture() {
 
   log_message "incident-start id=$incident_id reason=$reason"
   send_local_notification
-  if [[ ",$reason," == *",internet-down,"* ]]; then
-    capture_outage_path_diagnostics "$CURRENT_INCIDENT_DIR"
-  else
-    NETWORK_PATH_CLASSIFICATION="not-captured"
-    NETWORK_PATH_GATEWAY_STATUS="unknown"
-    NETWORK_PATH_EXTERNAL_STATUS="unknown"
-  fi
+  NETWORK_PATH_CLASSIFICATION="not-captured"
+  NETWORK_PATH_GATEWAY_STATUS="unknown"
+  NETWORK_PATH_EXTERNAL_STATUS="unknown"
+  capture_incident_network_changes "$CURRENT_INCIDENT_DIR"
   capture_detailed_state "$CURRENT_INCIDENT_DIR" "start"
 
   while (( $(epoch_now) < end )) && (( STOP_REQUESTED == 0 )); do
     sample_started="$(epoch_now)"
     collect_and_write_snapshot "$INCIDENT_INTERVAL_SECONDS" "$incident_file"
+    capture_incident_network_changes "$CURRENT_INCIDENT_DIR"
     now="$(epoch_now)"
     if (( webkit_sample_count < PROCESS_SAMPLE_MAX_PER_INCIDENT )) && \
       (( now - webkit_last_sample_epoch >= PROCESS_SAMPLE_COOLDOWN_SECONDS )) && \
@@ -2435,6 +2716,39 @@ run_once() {
   print -r -- "snapshot=$(timestamp) flags=${CONTEXT_FLAGS:-none} incident_flags=${TRIGGER_FLAGS:-none}"
 }
 
+run_diagnostic() {
+  local started="$(epoch_now)" diagnostic_dir
+  local SAFARI_FAULT_FOUND=0
+  diagnostic_dir="$(mktemp -d "$INCIDENTS_DIR/$(date '+%Y%m%d-%H%M%S')-manual-XXXXXX")" || return 1
+  # Reuse the same collectors with private scratch state. The running monitor
+  # remains the only writer to its routine buffers, cache and lifecycle state.
+  local CURRENT_INCIDENT_DIR="$diagnostic_dir"
+  local STATE_DIR="$diagnostic_dir/.state"
+  local SUMMARY_FILE="$diagnostic_dir/timeline.tsv"
+  local PROCESS_CONTEXT_FILE="$diagnostic_dir/.process-context.tsv"
+  local SAFARI_LIFECYCLE_FILE="$diagnostic_dir/safari-lifecycle.tsv"
+  local SAFARI_LIFECYCLE_STATE="$STATE_DIR/safari-lifecycle.state"
+  local INTERNET_PROBE_CACHE_FILE="$STATE_DIR/internet-probe.tsv"
+  local NETWORK_EVENTS_FILE="$diagnostic_dir/network-events.tsv"
+  mkdir -p "$STATE_DIR"
+  copy_recent_tsv_rows "$DATA_DIR/summary.tsv" "$diagnostic_dir/summary-before-trigger.tsv" "$REBOOT_POSTMORTEM_ROWS"
+  copy_recent_tsv_rows "$DATA_DIR/process-context.tsv" "$diagnostic_dir/process-context-before-trigger.tsv" "$PROCESS_CONTEXT_PRE_TRIGGER_ROWS"
+  {
+    print -r -- "started=$(timestamp)"
+    print -r -- "reason=manual-diagnostic"
+    print -r -- "monitor_version=$(<"$INSTALL_ROOT/VERSION")"
+    print -r -- "scope=one-shot; fresh HTTPS probe; no settings changed; post-recovery evidence cannot prove the earlier cause"
+  } >| "$diagnostic_dir/metadata.txt"
+  collect_and_write_snapshot 0
+  capture_detailed_state "$diagnostic_dir" current
+  capture_network_path_diagnostics "$diagnostic_dir"
+  capture_recent_system_logs "$diagnostic_dir" "$started" "$(epoch_now)"
+  finalize_incident "$diagnostic_dir" manual-diagnostic || true
+  rm -rf -- "$STATE_DIR"
+  rm -f -- "$PROCESS_CONTEXT_FILE"
+  print -r -- "$diagnostic_dir"
+}
+
 main_loop() {
   local power interval free_disk
   print -r -- "$$" >| "$PID_FILE"
@@ -2454,6 +2768,7 @@ main_loop() {
     fi
 
     collect_and_write_snapshot "$interval" "" "$power"
+    capture_pending_network_recovery
     handle_trigger_state "$TRIGGER_FLAGS"
     maybe_rotate_storage
     interruptible_sleep "$interval"
@@ -2476,6 +2791,10 @@ case "${1:-run}" in
     capture_network_reference manual "$(boot_epoch)" "$DATA_DIR/network-current.txt" || exit 1
     print -r -- "$DATA_DIR/network-current.txt"
     ;;
+  --diagnose)
+    run_diagnostic
+    maybe_rotate_storage 1
+    ;;
   --prepare-network-reboot)
     reference_boot="$(boot_epoch)"
     [[ "$reference_boot" == <-> ]] || exit 1
@@ -2484,7 +2803,7 @@ case "${1:-run}" in
     print -r -- "Network reference saved; one comparison will be captured after the next boot."
     ;;
   *)
-    print -u2 -- "Usage: $0 [run|--once|--force-incident|--network-diagnostic|--prepare-network-reboot]"
+    print -u2 -- "Usage: $0 [run|--once|--diagnose|--force-incident|--network-diagnostic|--prepare-network-reboot]"
     exit 2
     ;;
 esac

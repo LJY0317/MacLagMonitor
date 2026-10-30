@@ -18,7 +18,7 @@ MONITOR="$INSTALL_ROOT/bin/mac-lag-monitor.sh"
 
 usage() {
   print -r -- "MacLagMonitor control"
-  print -r -- "Usage: $0 {status|snapshot|network|prepare-reboot|test-trigger|start|stop|restart|logs|uninstall}"
+  print -r -- "Usage: $0 {status|snapshot|diagnose|network|prepare-reboot|test-trigger|start|stop|restart|logs|uninstall}"
 }
 
 is_running() {
@@ -46,6 +46,9 @@ case "${1:-}" in
     ;;
   network)
     "$MONITOR" --network-diagnostic
+    ;;
+  diagnose)
+    "$MONITOR" --diagnose
     ;;
   prepare-reboot)
     "$MONITOR" --prepare-network-reboot
