@@ -16,6 +16,8 @@ allowed=(
   uninstall.command
   bin/mac-lag-monitor.sh
   bin/mac-lag-monitorctl.sh
+  bin/maclagmonitor-native.swift
+  tests/verify-query.py
   bin/check-public-tree.sh
 )
 

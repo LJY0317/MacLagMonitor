@@ -72,6 +72,10 @@ if [[ -f "$INSTALL_ROOT/state/monitor.pid" ]]; then
 fi
 
 [[ -f "$PLIST_PATH" ]] && rm -f -- "$PLIST_PATH"
+CLI_LINK="$(sed -n '3p' "$INSTALL_ROOT/MANIFEST.txt" 2>/dev/null || true)"
+if [[ -n "$CLI_LINK" && -L "$CLI_LINK" && "$(readlink "$CLI_LINK")" == "$INSTALL_ROOT/bin/mac-lag-monitorctl.sh" ]]; then
+  rm -f -- "$CLI_LINK"
+fi
 find "$INSTALL_ROOT" -depth -delete 2>/dev/null
 
 leftovers=0

@@ -14,7 +14,9 @@ DATA_DIR="${INSTALL_ROOT}/data"
 INCIDENTS_DIR="${DATA_DIR}/incidents"
 STATE_DIR="${INSTALL_ROOT}/state"
 LOG_DIR="${INSTALL_ROOT}/logs"
-SUMMARY_FILE="${DATA_DIR}/summary.tsv"
+SUMMARY_FILE="${STATE_DIR}/recent-detection.tsv"
+HISTORICAL_SUMMARY_FILE="${DATA_DIR}/summary.tsv"
+NATIVE_BIN="${INSTALL_ROOT}/bin/maclagmonitor-native"
 NETWORK_EVENTS_FILE="${DATA_DIR}/network-events.tsv"
 INTERNET_PROBE_CACHE_FILE="${STATE_DIR}/internet-probe.tsv"
 PROCESS_CONTEXT_FILE="${DATA_DIR}/process-context.tsv"
@@ -69,8 +71,8 @@ source "$CONFIG_FILE"
 : "${SAFARI_FAULT_EXTRACT_MAX_KB:=256}"
 : "${STORAGE_MAINTENANCE_INTERVAL_SECONDS:=21600}"
 : "${LAUNCHD_LOG_SIZE_LIMIT_MB:=2}"
-: "${SUMMARY_LEGACY_RETENTION_DAYS:=30}"
-: "${SUMMARY_LEGACY_SIZE_LIMIT_MB:=20}"
+: "${HISTORY_RETENTION_DAYS:=30}"
+: "${HISTORY_SIZE_LIMIT_MB:=20}"
 : "${MACOS_RESOURCE_REPORT_MAX_KB:=256}"
 : "${REBOOT_POSTMORTEM_ROWS:=40}"
 : "${DOMAIN_CORRELATION_MAX_INCIDENTS:=10}"
@@ -95,6 +97,7 @@ source "$CONFIG_FILE"
 mkdir -p "$DATA_DIR" "$INCIDENTS_DIR" "$STATE_DIR" "$LOG_DIR"
 
 FORCE_TRIGGER=0
+FORCE_MEMORY_EVENT=0
 STOP_REQUESTED=0
 CURRENT_INCIDENT_DIR=""
 CONTEXT_FLAGS=""
@@ -223,12 +226,28 @@ interruptible_sleep() {
   SLEEP_PID=0
 }
 
+wait_for_detection() {
+  local seconds="$1" memory=1 rc=0
+  [[ -f "$STATE_DIR/episode-memory.active" ]] && memory=2
+  "$NATIVE_BIN" wait "$seconds" "$memory" &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null || rc=$?
+  SLEEP_PID=0
+  (( FORCE_TRIGGER == 1 || STOP_REQUESTED == 1 )) && return 0
+  case "$rc" in
+    10) FORCE_MEMORY_EVENT=1 ;;
+    12) rm -f -- "$STATE_DIR/episode-memory.active" ;;
+    0|11|143) ;;
+    *) log_message "event-wait-error exit=$rc"; interruptible_sleep "$seconds" ;;
+  esac
+}
+
 cleanup_runtime_temp_files() {
   rm -f -- \
     "$STATE_DIR/.internet-primary.$$" "$STATE_DIR/.internet-secondary.$$" \
     "$SUMMARY_FILE.trim.$$" "$SUMMARY_FILE.body.$$" \
       "$NETWORK_EVENTS_FILE.trim.$$" "$NETWORK_EVENTS_FILE.body.$$" \
-      "$PROCESS_CONTEXT_FILE.append.$$" 2>/dev/null || true
+      2>/dev/null || true
   if [[ -n "$CURRENT_INCIDENT_DIR" && "$CURRENT_INCIDENT_DIR" == "$INCIDENTS_DIR"/* ]]; then
     rm -f -- \
       "$CURRENT_INCIDENT_DIR/.system-log.tmp" \
@@ -300,7 +319,6 @@ cleanup() {
   fi
 }
 
-cleanup_stale_runtime_temp_files
 trap 'handle_manual_trigger' USR1
 trap 'cleanup; exit 0' INT TERM HUP
 trap 'cleanup' EXIT
@@ -314,12 +332,6 @@ integer_value() {
 
 is_number() {
   [[ "${1:-}" == <-> || "${1:-}" == <->.<-> ]]
-}
-
-mb_from_kb() {
-  local kb="${1:-0}"
-  [[ "$kb" == <-> ]] || kb=0
-  printf '%.1f\n' "$(( kb / 1024.0 ))"
 }
 
 current_power_mode() {
@@ -339,9 +351,7 @@ low_power_enabled() {
 }
 
 display_is_off() {
-  local state
-  state="$(ioreg -r -n IODisplayWrangler -d 1 2>/dev/null | awk -F'= ' '/CurrentPowerState/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
-  [[ -n "$state" && "$state" -lt 4 ]]
+  [[ -x "$NATIVE_BIN" && "$("$NATIVE_BIN" display 2>/dev/null)" == off ]]
 }
 
 choose_interval() {
@@ -830,7 +840,7 @@ capture_pending_network_recovery() {
 }
 
 collect_vm_metrics() {
-  local vm pressure swap_line
+  local detailed="${1:-1}" vm pressure swap_line
   vm="$(vm_stat 2>/dev/null)"
   read -r VM_FREE_MB COMPRESSOR_MB COMPRESSED_LOGICAL_MB <<< "$(print -r -- "$vm" | awk '
     /page size of/ {gsub(/[^0-9]/,"",$8); p=$8}
@@ -846,10 +856,14 @@ collect_vm_metrics() {
       }
     }')"
 
+  if (( detailed == 0 )); then
+    MEMORY_FREE_PERCENT=unknown; VM_FREE_MB=unknown
+    COMPRESSED_LOGICAL_MB=unknown; SWAP_USED_MB=unknown
+    return 0
+  fi
   pressure="$(memory_pressure 2>/dev/null | awk -F': ' '/System-wide memory free percentage/ {gsub(/%/,"",$2); print $2; exit}')"
   [[ "$pressure" == <-> ]] || pressure="unknown"
   MEMORY_FREE_PERCENT="$pressure"
-
   swap_line="$(sysctl vm.swapusage 2>/dev/null)"
   SWAP_USED_MB="${swap_line#*used = }"
   SWAP_USED_MB="${SWAP_USED_MB%%M*}"
@@ -861,47 +875,23 @@ collect_process_metrics() {
   ps_data="$("$PS_BIN" -axo pid=,ppid=,%cpu=,rss=,etime=,comm= 2>/dev/null)"
   ps_exit=$?
   PROCESS_SNAPSHOT_DATA="$ps_data"
-  total_rows="$(print -r -- "$ps_data" | awk 'NF {n++} END {print n+0}')"
-  valid_rows="$(print -r -- "$ps_data" | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+(\.[0-9]+)?$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9:-]+$/ {n++} END {print n+0}')"
-  if (( ps_exit != 0 )); then
-    PROCESS_SNAPSHOT_STATUS="failed"
-  elif (( total_rows == 0 )); then
-    PROCESS_SNAPSHOT_STATUS="empty"
-  elif (( valid_rows == 0 )); then
-    PROCESS_SNAPSHOT_STATUS="parse-failed"
-  elif (( valid_rows < total_rows )); then
-    PROCESS_SNAPSHOT_STATUS="partial"
-  else
-    PROCESS_SNAPSHOT_STATUS="ok"
-  fi
-
-  SAFARI_GROUP_KB=unknown; WEBKIT_TOTAL_KB=unknown; WEBKIT_MAX_KB=unknown
-  WEBKIT_MAX_PID=unknown; WINDOWSERVER_CPU=unknown; WINDOWSERVER_KB=unknown
-  AUX_APP_1_KB=unknown; AUX_APP_2_KB=unknown; SAFARI_PID=0; SAFARI_UPTIME=unknown
-  WEBKIT_PROCESS_COUNT=unknown; REPORTCRASH_CPU=unknown; CORESYMBOLICATION_CPU=unknown
-  CONTENT_FILTER_CPU=unknown; CONTENT_FILTER_RUNNING=unknown; WEBKIT_HOT_CPU=unknown
-  WEBKIT_HOT_PID=unknown; WEBKIT_HOT_KB=unknown; MEDIAANALYSISD_CPU=unknown
-  MOBILEASSETD_CPU=unknown; REPLAYD_CPU=unknown; SAFARI_START_ID=unknown
-  WATCH_PROCESS_COUNT=unknown; WATCH_PROCESS_CPU=unknown; WATCH_PROCESS_KB=unknown
-  WATCH_PROCESS_HOT_CPU=unknown; WATCH_PROCESS_HOT_PID=unknown; WATCH_PROCESS_HOT_KB=unknown
-  [[ "$PROCESS_SNAPSHOT_STATUS" == "ok" ]] || {
-    SAFARI_GROUP_MB=unknown; WEBKIT_TOTAL_MB=unknown; WEBKIT_MAX_MB=unknown
-    WINDOWSERVER_MB=unknown; AUX_APP_1_MB=unknown; AUX_APP_2_MB=unknown; WEBKIT_HOT_MB=unknown
-    WATCH_PROCESS_MB=unknown; WATCH_PROCESS_HOT_MB=unknown
-    return
-  }
-
-  read -r SAFARI_GROUP_KB WEBKIT_TOTAL_KB WEBKIT_MAX_KB WEBKIT_MAX_PID \
-    WINDOWSERVER_CPU WINDOWSERVER_KB AUX_APP_1_KB AUX_APP_2_KB \
+  read -r total_rows valid_rows SAFARI_GROUP_MB WEBKIT_TOTAL_MB WEBKIT_MAX_MB WEBKIT_MAX_PID \
+    WINDOWSERVER_CPU WINDOWSERVER_MB AUX_APP_1_MB AUX_APP_2_MB \
     SAFARI_PID SAFARI_UPTIME SAFARI_START_ID WEBKIT_PROCESS_COUNT REPORTCRASH_CPU \
     CORESYMBOLICATION_CPU CONTENT_FILTER_CPU CONTENT_FILTER_RUNNING WEBKIT_HOT_CPU \
-    WEBKIT_HOT_PID WEBKIT_HOT_KB MEDIAANALYSISD_CPU MOBILEASSETD_CPU \
-    REPLAYD_CPU WATCH_PROCESS_COUNT WATCH_PROCESS_CPU WATCH_PROCESS_KB \
-    WATCH_PROCESS_HOT_CPU WATCH_PROCESS_HOT_PID WATCH_PROCESS_HOT_KB <<< "$(print -r -- "$ps_data" | awk \
+    WEBKIT_HOT_PID WEBKIT_HOT_MB MEDIAANALYSISD_CPU MOBILEASSETD_CPU \
+    REPLAYD_CPU WATCH_PROCESS_COUNT WATCH_PROCESS_CPU WATCH_PROCESS_MB \
+    WATCH_PROCESS_HOT_CPU WATCH_PROCESS_HOT_PID WATCH_PROCESS_HOT_MB <<< "$(print -r -- "$ps_data" | awk \
       -v aux1="$AUX_APP_1_PROCESS_REGEX" \
       -v aux2="$AUX_APP_2_PROCESS_REGEX" \
       -v watch="$WATCH_PROCESS_REGEX" \
       -v filter_re="$CONTENT_FILTER_PROCESS_REGEX" '
+    !NF {next}
+    {
+      total++
+      if ($1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+(\.[0-9]+)?$/ || $4 !~ /^[0-9]+$/ || $5 !~ /^[0-9:-]+$/) next
+      valid++
+    }
     /\/Safari\.app\/|\/WebKit\.framework\/.*com\.apple\.WebKit/ {safari += $4}
     /\/WebKit\.framework\/.*com\.apple\.WebKit\.WebContent/ {
       webkit += $4; webkit_count++
@@ -931,17 +921,38 @@ collect_process_metrics() {
         else start_age=(clock[1]*60)+clock[2]
       } else start_age="-"
       if (safari_uptime == "") safari_uptime="-"
-      printf "%d %d %d %d %.1f %d %d %d %d %s %s %d %.1f %.1f %.1f %d %.1f %d %d %.1f %.1f %.1f %d %.1f %d %.1f %d %d\n",
-        safari+0, webkit+0, webkit_max+0, webkit_pid+0,
-        window_cpu+0, window_kb+0, aux1_kb+0, aux2_kb+0,
+      printf "%d %d %.1f %.1f %.1f %d %.1f %.1f %.1f %.1f %d %s %s %d %.1f %.1f %.1f %d %.1f %d %.1f %.1f %.1f %.1f %d %.1f %.1f %.1f %d %.1f\n",
+        total+0, valid+0, safari/1024, webkit/1024, webkit_max/1024, webkit_pid+0,
+        window_cpu+0, window_kb/1024, aux1_kb/1024, aux2_kb/1024,
         safari_pid+0, safari_uptime, start_age, webkit_count+0,
         report_cpu+0, symbol_cpu+0, filter_cpu+0, filter_running+0,
-        webkit_cpu_max+0, webkit_cpu_pid+0, webkit_cpu_kb+0,
+        webkit_cpu_max+0, webkit_cpu_pid+0, webkit_cpu_kb/1024,
         mediaanalysis_cpu+0, mobileasset_cpu+0, replay_cpu+0,
-        watch_count+0, watch_cpu+0, watch_kb+0,
-        watch_cpu_max+0, watch_cpu_pid+0, watch_cpu_kb+0
+        watch_count+0, watch_cpu+0, watch_kb/1024,
+        watch_cpu_max+0, watch_cpu_pid+0, watch_cpu_kb/1024
     }')"
 
+  if (( ps_exit != 0 )); then
+    PROCESS_SNAPSHOT_STATUS=failed
+  elif (( total_rows == 0 )); then
+    PROCESS_SNAPSHOT_STATUS=empty
+  elif (( valid_rows == 0 )); then
+    PROCESS_SNAPSHOT_STATUS=parse-failed
+  elif (( valid_rows < total_rows )); then
+    PROCESS_SNAPSHOT_STATUS=partial
+  else
+    PROCESS_SNAPSHOT_STATUS=ok
+  fi
+  if [[ "$PROCESS_SNAPSHOT_STATUS" != ok ]]; then
+    SAFARI_GROUP_MB=unknown; WEBKIT_TOTAL_MB=unknown; WEBKIT_MAX_MB=unknown; WEBKIT_MAX_PID=unknown
+    WINDOWSERVER_CPU=unknown; WINDOWSERVER_MB=unknown; AUX_APP_1_MB=unknown; AUX_APP_2_MB=unknown
+    SAFARI_PID=0; SAFARI_UPTIME=unknown; SAFARI_START_ID=unknown; WEBKIT_PROCESS_COUNT=unknown
+    REPORTCRASH_CPU=unknown; CORESYMBOLICATION_CPU=unknown; CONTENT_FILTER_CPU=unknown; CONTENT_FILTER_RUNNING=unknown
+    WEBKIT_HOT_CPU=unknown; WEBKIT_HOT_PID=unknown; WEBKIT_HOT_MB=unknown; MEDIAANALYSISD_CPU=unknown
+    MOBILEASSETD_CPU=unknown; REPLAYD_CPU=unknown; WATCH_PROCESS_COUNT=unknown; WATCH_PROCESS_CPU=unknown
+    WATCH_PROCESS_MB=unknown; WATCH_PROCESS_HOT_CPU=unknown; WATCH_PROCESS_HOT_PID=unknown; WATCH_PROCESS_HOT_MB=unknown
+    return 0
+  fi
   if [[ "$SAFARI_PID" != "0" && "$SAFARI_START_ID" == <-> ]]; then
     local observation_epoch
     observation_epoch="$(epoch_now)"
@@ -953,17 +964,7 @@ collect_process_metrics() {
   else
     SAFARI_START_ID=unknown
   fi
-  SAFARI_GROUP_MB="$(mb_from_kb "$SAFARI_GROUP_KB")"
-  WEBKIT_TOTAL_MB="$(mb_from_kb "$WEBKIT_TOTAL_KB")"
-  WEBKIT_MAX_MB="$(mb_from_kb "$WEBKIT_MAX_KB")"
-  WINDOWSERVER_MB="$(mb_from_kb "$WINDOWSERVER_KB")"
-  AUX_APP_1_MB="$(mb_from_kb "$AUX_APP_1_KB")"
-  AUX_APP_2_MB="$(mb_from_kb "$AUX_APP_2_KB")"
-  WEBKIT_HOT_MB="$(mb_from_kb "$WEBKIT_HOT_KB")"
-  if [[ -n "$WATCH_PROCESS_REGEX" ]]; then
-    WATCH_PROCESS_MB="$(mb_from_kb "$WATCH_PROCESS_KB")"
-    WATCH_PROCESS_HOT_MB="$(mb_from_kb "$WATCH_PROCESS_HOT_KB")"
-  else
+  if [[ -z "$WATCH_PROCESS_REGEX" ]]; then
     WATCH_PROCESS_COUNT=disabled
     WATCH_PROCESS_CPU=disabled
     WATCH_PROCESS_MB=disabled
@@ -980,10 +981,8 @@ ensure_tsv_header() {
     return
   fi
   [[ "$(head -n 1 "$file" 2>/dev/null)" == "$header" ]] || {
-    local legacy="${file:r}-legacy-$(date '+%Y%m%d-%H%M%S').${file:e}"
-    mv -f -- "$file" "$legacy"
-    print -r -- "$header" >| "$file"
-    log_message "tsv-schema-upgrade file=${file:t} legacy=${legacy:t}"
+    log_message "tsv-schema-mismatch file=${file:t}"
+    return 1
   }
 }
 
@@ -1006,7 +1005,7 @@ trim_tsv_to_bytes() {
 }
 
 record_process_context() {
-  local captured_at="$1" snapshot_id="$2" header
+  local captured_at="$1" snapshot_id="$2" header target cutoff
   local cpu_count="$PROCESS_CONTEXT_TOP_CPU_COUNT" rss_count="$PROCESS_CONTEXT_TOP_RSS_COUNT" depth="$PROCESS_CONTEXT_PARENT_DEPTH"
   [[ -n "${PROCESS_SNAPSHOT_DATA:-}" ]] || return
   [[ "$cpu_count" == <-> ]] || cpu_count=3
@@ -1015,7 +1014,9 @@ record_process_context() {
   (( cpu_count > 0 || rss_count > 0 )) || return
   (( depth >= 0 )) || depth=0
   header=$'captured_at\tsnapshot_id\tselection\tpid\tppid\tcpu_pct\trss_kb\tetime\texecutable\tparent_chain_scope'
-  ensure_tsv_header "$PROCESS_CONTEXT_FILE" "$header"
+  target="$PROCESS_CONTEXT_FILE"
+  [[ -n "$CURRENT_INCIDENT_DIR" ]] && target="$CURRENT_INCIDENT_DIR/process-context.tsv"
+  ensure_tsv_header "$target" "$header" || return
   print -r -- "$PROCESS_SNAPSHOT_DATA" | awk -v ts="$captured_at" -v sid="$snapshot_id" -v cpu_limit="$cpu_count" -v rss_limit="$rss_count" -v parent_depth="$depth" -v max_rows="$PROCESS_CONTEXT_MAX_ROWS" -v watch_pid="${WATCH_PROCESS_HOT_PID:-}" '
     function command_name(   i, value) {
       value=$6
@@ -1073,21 +1074,19 @@ record_process_context() {
         printf "%s\t%s\t%s\t%s\t%s\t%.1f\t%s\t%s\t%s\t%s\n", ts, sid, roles[pid], pid, ppid[pid], cpu[pid], rss[pid], elapsed[pid], executable[pid], scope
         rows++
       }
-    }' >| "$PROCESS_CONTEXT_FILE.append.$$"
-  cat "$PROCESS_CONTEXT_FILE.append.$$" >> "$PROCESS_CONTEXT_FILE"
-  if [[ -n "${CURRENT_INCIDENT_DIR:-}" ]]; then
-    ensure_tsv_header "$CURRENT_INCIDENT_DIR/process-context.tsv" "$header"
-    cat "$PROCESS_CONTEXT_FILE.append.$$" >> "$CURRENT_INCIDENT_DIR/process-context.tsv"
+    }' >> "$target"
+  if [[ -z "$CURRENT_INCIDENT_DIR" ]]; then
+    cutoff="$(date -r $(( $(epoch_now) - PRE_TRIGGER_MINUTES * 60 )) '+%Y-%m-%dT%H:%M:%S%z')"
+    prune_recent_tsv "$target" "$cutoff"
+    trim_tsv_to_bytes "$target" $(( PROCESS_CONTEXT_SIZE_LIMIT_KB * 1024 ))
   fi
-  rm -f -- "$PROCESS_CONTEXT_FILE.append.$$"
-  trim_tsv_to_bytes "$PROCESS_CONTEXT_FILE" $(( PROCESS_CONTEXT_SIZE_LIMIT_KB * 1024 ))
 }
 
 record_safari_lifecycle() {
   local captured_at="$1" header previous_timestamp="unknown" previous_pid="unknown" previous_start="unknown" previous_group="unknown" previous_webkit="unknown"
   local events=() group_drop=0 webkit_drop=0
   header=$'observed_at\tobservation_window_start\tevents\tprevious_safari_pid\tcurrent_safari_pid\tprevious_safari_and_all_webkit_group_mb\tcurrent_safari_and_all_webkit_group_mb\tprevious_all_webkit_webcontent_count\tcurrent_all_webkit_webcontent_count\tscope\tinterpretation_limit'
-  ensure_tsv_header "$SAFARI_LIFECYCLE_FILE" "$header"
+  ensure_tsv_header "$SAFARI_LIFECYCLE_FILE" "$header" || return
   if [[ "${PROCESS_SNAPSHOT_STATUS:-unknown}" != "ok" ]]; then
     log_message "safari-lifecycle skipped process_snapshot_status=${PROCESS_SNAPSHOT_STATUS:-unknown}"
     return
@@ -1114,7 +1113,7 @@ record_safari_lifecycle() {
   fi
   if (( ${#events} > 0 )); then
     print -r -- "${captured_at}"$'\t'"${previous_timestamp}"$'\t'"${(j:,:)events}"$'\t'"${previous_pid}"$'\t'"${SAFARI_PID}"$'\t'"${previous_group}"$'\t'"${SAFARI_GROUP_MB}"$'\t'"${previous_webkit}"$'\t'"${WEBKIT_PROCESS_COUNT}"$'\t'"Safari app plus all com.apple.WebKit processes; WebKit may include non-Safari apps"$'\t'"observed between samples; etime is an approximate start identity; event is bounded to the observation window and does not establish exit cause or causation" >> "$SAFARI_LIFECYCLE_FILE"
-    if [[ -n "${CURRENT_INCIDENT_DIR:-}" ]]; then
+    if [[ -n "${CURRENT_INCIDENT_DIR:-}" && "$SAFARI_LIFECYCLE_FILE" != "$CURRENT_INCIDENT_DIR/safari-lifecycle.tsv" ]]; then
       ensure_tsv_header "$CURRENT_INCIDENT_DIR/safari-lifecycle.tsv" "$header"
       tail -n 1 "$SAFARI_LIFECYCLE_FILE" >> "$CURRENT_INCIDENT_DIR/safari-lifecycle.tsv"
     fi
@@ -1125,17 +1124,17 @@ record_safari_lifecycle() {
 
 determine_trigger_flags() {
   local -a context_flags trigger_flags
-  local load_high=0
   context_flags=()
   trigger_flags=()
 
+  # Memory and OS events are independent of process enumeration.
+  is_number "${MEMORY_FREE_PERCENT:-unknown}" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= MEMORY_FREE_PERCENT_THRESHOLD )) && context_flags+=("memory-pressure")
+  is_number "${COMPRESSOR_MB:-unknown}" && (( $(integer_value "$COMPRESSOR_MB") >= COMPRESSOR_MB_THRESHOLD )) && context_flags+=("compressor-high")
+  is_number "${MEMORY_FREE_PERCENT:-unknown}" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= INCIDENT_MEMORY_FREE_PERCENT_THRESHOLD )) && trigger_flags+=("memory-pressure")
+  is_number "${COMPRESSOR_MB:-unknown}" && (( $(integer_value "$COMPRESSOR_MB") >= INCIDENT_COMPRESSOR_MB_THRESHOLD )) && trigger_flags+=("compressor-high")
   if [[ "${PROCESS_SNAPSHOT_STATUS:-unknown}" != "ok" ]]; then
     context_flags+=("process-snapshot-${PROCESS_SNAPSHOT_STATUS:-unknown}")
   else
-
-    # Context flags preserve the sensitive historical signals in summary.tsv.
-    is_number "$MEMORY_FREE_PERCENT" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= MEMORY_FREE_PERCENT_THRESHOLD )) && context_flags+=("memory-pressure")
-    (( $(integer_value "$COMPRESSOR_MB") >= COMPRESSOR_MB_THRESHOLD )) && context_flags+=("compressor-high")
     (( $(integer_value "$SAFARI_GROUP_MB") >= SAFARI_GROUP_MB_THRESHOLD )) && context_flags+=("safari-high")
     (( $(integer_value "$WEBKIT_MAX_MB") >= WEBKIT_PROCESS_MB_THRESHOLD )) && context_flags+=("webkit-process-high")
     (( $(integer_value "$WINDOWSERVER_CPU") >= WINDOWSERVER_CPU_THRESHOLD )) && context_flags+=("windowserver-high")
@@ -1146,8 +1145,6 @@ determine_trigger_flags() {
 
     # Incident thresholds are intentionally much stricter so routine heavy use is
     # recorded as context without automatically starting a four-minute capture.
-    is_number "$MEMORY_FREE_PERCENT" && (( $(integer_value "$MEMORY_FREE_PERCENT") <= INCIDENT_MEMORY_FREE_PERCENT_THRESHOLD )) && trigger_flags+=("memory-pressure")
-    (( $(integer_value "$COMPRESSOR_MB") >= INCIDENT_COMPRESSOR_MB_THRESHOLD )) && trigger_flags+=("compressor-high")
     (( $(integer_value "$SAFARI_GROUP_MB") >= INCIDENT_SAFARI_GROUP_MB_THRESHOLD )) && trigger_flags+=("safari-high")
     (( $(integer_value "$WEBKIT_MAX_MB") >= INCIDENT_WEBKIT_PROCESS_MB_THRESHOLD )) && trigger_flags+=("webkit-process-high")
     (( $(integer_value "$WINDOWSERVER_CPU") >= INCIDENT_WINDOWSERVER_CPU_THRESHOLD )) && trigger_flags+=("windowserver-high")
@@ -1172,11 +1169,15 @@ determine_trigger_flags() {
       context_flags+=("replayd-high")
       trigger_flags+=("replayd-high")
     fi
-    (( $(integer_value "${LOAD_1M:-0}") >= LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD )) && load_high=1
-    if (( load_high == 1 )); then
-      context_flags+=("system-load-high")
-      trigger_flags+=("system-load-high")
-    fi
+  fi
+  if [[ -n "${LOAD_1M:-}" ]] && (( $(integer_value "$LOAD_1M") >= LOGICAL_CPU_COUNT * SYSTEM_LOAD_PER_LOGICAL_CPU_THRESHOLD )); then
+    context_flags+=("system-load-high")
+    trigger_flags+=("system-load-high")
+  fi
+  if (( ${FORCE_MEMORY_EVENT:-0} == 1 )); then
+    context_flags+=("os-memory-pressure-critical")
+    trigger_flags+=("os-memory-pressure-critical")
+    FORCE_MEMORY_EVENT=0
   fi
   if (( INTERNET_OUTAGE_NEW == 1 )); then
     context_flags+=("internet-down")
@@ -1195,21 +1196,28 @@ summary_header() {
   print -r -- $'timestamp\tpower\tinterval_sec\tmemory_pressure_free_pct\tvm_free_mb\tcompressor_physical_mb\tcompressor_logical_mb\tswap_used_mb\tload_1m\tsafari_and_all_webkit_group_mb\tall_webkit_webcontent_mb\twebkit_max_mb\twebkit_max_pid\twindowserver_cpu_pct\twindowserver_mb\taux_app_1_mb\taux_app_2_mb\twatched_process_count\twatched_process_cpu_pct\twatched_process_rss_mb\twatched_process_hot_cpu_pct\twatched_process_hot_pid\twatched_process_hot_rss_mb\tnetwork_state\tinternet_state\tdns_state\tinternet_latency_ms\tinternet_probe_codes\tinternet_last_success\toutage_started\tsafari_pid\tsafari_uptime\tall_webkit_webcontent_count\treportcrash_cpu_pct\tcoresymbolication_cpu_pct\tcontent_filter_cpu_pct\twebkit_hot_cpu_pct\twebkit_hot_pid\twebkit_hot_mb\tmediaanalysisd_cpu_pct\tmobileassetd_cpu_pct\treplayd_cpu_pct\tprocess_snapshot_status\tflags'
 }
 
+detection_header() {
+  print -r -- $'timestamp\tpower\tinterval_sec\tcompressor_physical_mb\tload_1m\tsafari_and_all_webkit_group_mb\twebkit_max_mb\twebkit_max_pid\twindowserver_cpu_pct\twebkit_hot_cpu_pct\twebkit_hot_pid\twatch_process_hot_pid\twatch_process_hot_cpu_pct\tnetwork_state\tinternet_state\tdns_state\tinternet_latency_ms\tinternet_probe_codes\tinternet_last_success\toutage_started\tsafari_pid\tprocess_snapshot_status\tflags'
+}
+
 ensure_summary_header() {
-  local expected first legacy
-  expected="$(summary_header)"
+  local expected first
+  expected="$(detection_header)"
   if [[ -s "$SUMMARY_FILE" ]]; then
     first="$(head -n 1 "$SUMMARY_FILE")"
-    if [[ "$first" != "$expected" ]]; then
-      legacy="$DATA_DIR/summary-legacy-$(date '+%Y%m%d-%H%M%S').tsv"
-      mv -f -- "$SUMMARY_FILE" "$legacy"
-      (( $(stat -f '%z' "$legacy" 2>/dev/null || print 0) > 10485760 )) && trim_file_to_bytes "$legacy" 10485760
-      log_message "summary-schema-upgrade legacy=${legacy:t}"
-    fi
+    [[ "$first" == "$expected" ]] && return 0
   fi
-  if [[ ! -s "$SUMMARY_FILE" ]]; then
-    print -r -- "$expected" >| "$SUMMARY_FILE"
-  fi
+  # This is a regenerable recent-detection buffer, not a history file.
+  print -r -- "$expected" >| "$SUMMARY_FILE"
+}
+
+prune_recent_tsv() {
+  local file="$1" cutoff="$2" first
+  [[ -s "$file" ]] || return 0
+  first="$(sed -n '2{p;q;}' "$file")"
+  [[ -n "$first" && "${first%%$'\t'*}" < "$cutoff" ]] || return 0
+  awk -F '\t' -v cutoff="$cutoff" 'NR==1 || $1 >= cutoff' "$file" >| "$file.trim.$$" &&
+    mv -f -- "$file.trim.$$" "$file"
 }
 
 copy_recent_tsv_rows() {
@@ -1229,14 +1237,15 @@ copy_recent_tsv_rows() {
 
 collect_and_write_snapshot() {
   local interval="$1" destination="${2:-}" supplied_power="${3:-}"
-  local power load1 network line started finished elapsed captured_at snapshot_id tab=$'\t'
+  local power load1 network line started finished elapsed captured_at snapshot_id cutoff detailed=0 tab=$'\t'
   started="$(epoch_now)"
   if [[ -n "$supplied_power" ]]; then
     power="$supplied_power"
   else
     power="$(current_power_mode)"
   fi
-  collect_vm_metrics
+  [[ -n "$destination" ]] && detailed=1
+  collect_vm_metrics "$detailed"
   collect_process_metrics
   network="$(update_network_state_if_due)"
   collect_internet_metrics "$network"
@@ -1244,7 +1253,6 @@ collect_and_write_snapshot() {
   [[ -n "$load1" ]] || load1="0"
   LOAD_1M="$load1"
   determine_trigger_flags
-  ensure_summary_header
 
   captured_at="$(timestamp)"
   snapshot_id="${captured_at}:$$"
@@ -1259,9 +1267,18 @@ collect_and_write_snapshot() {
     [[ -n "$TRIGGER_FLAGS" ]] && TRIGGER_FLAGS+=","
     TRIGGER_FLAGS+="monitor-sample-stall"
   fi
-  line="${captured_at}${tab}${power}${tab}${interval}${tab}${MEMORY_FREE_PERCENT}${tab}${VM_FREE_MB}${tab}${COMPRESSOR_MB}${tab}${COMPRESSED_LOGICAL_MB}${tab}${SWAP_USED_MB}${tab}${load1}${tab}${SAFARI_GROUP_MB}${tab}${WEBKIT_TOTAL_MB}${tab}${WEBKIT_MAX_MB}${tab}${WEBKIT_MAX_PID}${tab}${WINDOWSERVER_CPU}${tab}${WINDOWSERVER_MB}${tab}${AUX_APP_1_MB}${tab}${AUX_APP_2_MB}${tab}${WATCH_PROCESS_COUNT}${tab}${WATCH_PROCESS_CPU}${tab}${WATCH_PROCESS_MB}${tab}${WATCH_PROCESS_HOT_CPU}${tab}${WATCH_PROCESS_HOT_PID}${tab}${WATCH_PROCESS_HOT_MB}${tab}${network}${tab}${INTERNET_STATE}${tab}${DNS_STATE}${tab}${INTERNET_LATENCY_MS}${tab}${INTERNET_PROBE_CODES}${tab}${INTERNET_LAST_SUCCESS}${tab}${INTERNET_OUTAGE_STARTED}${tab}${SAFARI_PID}${tab}${SAFARI_UPTIME}${tab}${WEBKIT_PROCESS_COUNT}${tab}${REPORTCRASH_CPU}${tab}${CORESYMBOLICATION_CPU}${tab}${CONTENT_FILTER_CPU}${tab}${WEBKIT_HOT_CPU}${tab}${WEBKIT_HOT_PID}${tab}${WEBKIT_HOT_MB}${tab}${MEDIAANALYSISD_CPU}${tab}${MOBILEASSETD_CPU}${tab}${REPLAYD_CPU}${tab}${PROCESS_SNAPSHOT_STATUS}${tab}${CONTEXT_FLAGS}"
-  print -r -- "$line" >> "$SUMMARY_FILE"
-  [[ -n "$destination" ]] && print -r -- "$line" >> "$destination"
+  if [[ -n "$destination" ]]; then
+    line="${captured_at}${tab}${power}${tab}${interval}${tab}${MEMORY_FREE_PERCENT}${tab}${VM_FREE_MB}${tab}${COMPRESSOR_MB}${tab}${COMPRESSED_LOGICAL_MB}${tab}${SWAP_USED_MB}${tab}${load1}${tab}${SAFARI_GROUP_MB}${tab}${WEBKIT_TOTAL_MB}${tab}${WEBKIT_MAX_MB}${tab}${WEBKIT_MAX_PID}${tab}${WINDOWSERVER_CPU}${tab}${WINDOWSERVER_MB}${tab}${AUX_APP_1_MB}${tab}${AUX_APP_2_MB}${tab}${WATCH_PROCESS_COUNT}${tab}${WATCH_PROCESS_CPU}${tab}${WATCH_PROCESS_MB}${tab}${WATCH_PROCESS_HOT_CPU}${tab}${WATCH_PROCESS_HOT_PID}${tab}${WATCH_PROCESS_HOT_MB}${tab}${network}${tab}${INTERNET_STATE}${tab}${DNS_STATE}${tab}${INTERNET_LATENCY_MS}${tab}${INTERNET_PROBE_CODES}${tab}${INTERNET_LAST_SUCCESS}${tab}${INTERNET_OUTAGE_STARTED}${tab}${SAFARI_PID}${tab}${SAFARI_UPTIME}${tab}${WEBKIT_PROCESS_COUNT}${tab}${REPORTCRASH_CPU}${tab}${CORESYMBOLICATION_CPU}${tab}${CONTENT_FILTER_CPU}${tab}${WEBKIT_HOT_CPU}${tab}${WEBKIT_HOT_PID}${tab}${WEBKIT_HOT_MB}${tab}${MEDIAANALYSISD_CPU}${tab}${MOBILEASSETD_CPU}${tab}${REPLAYD_CPU}${tab}${PROCESS_SNAPSHOT_STATUS}${tab}${CONTEXT_FLAGS}"
+    ensure_tsv_header "$destination" "$(summary_header)" || return
+    print -r -- "$line" >> "$destination"
+  else
+    line="${captured_at}${tab}${power}${tab}${interval}${tab}${COMPRESSOR_MB}${tab}${load1}${tab}${SAFARI_GROUP_MB}${tab}${WEBKIT_MAX_MB}${tab}${WEBKIT_MAX_PID}${tab}${WINDOWSERVER_CPU}${tab}${WEBKIT_HOT_CPU}${tab}${WEBKIT_HOT_PID}${tab}${WATCH_PROCESS_HOT_PID}${tab}${WATCH_PROCESS_HOT_CPU}${tab}${network}${tab}${INTERNET_STATE}${tab}${DNS_STATE}${tab}${INTERNET_LATENCY_MS}${tab}${INTERNET_PROBE_CODES}${tab}${INTERNET_LAST_SUCCESS}${tab}${INTERNET_OUTAGE_STARTED}${tab}${SAFARI_PID}${tab}${PROCESS_SNAPSHOT_STATUS}${tab}${CONTEXT_FLAGS}"
+    ensure_summary_header
+    print -r -- "$line" >> "$SUMMARY_FILE"
+    cutoff="$(date -r $(( $(epoch_now) - PRE_TRIGGER_MINUTES * 60 )) '+%Y-%m-%dT%H:%M:%S%z')"
+    prune_recent_tsv "$SUMMARY_FILE" "$cutoff"
+    trim_tsv_to_bytes "$SUMMARY_FILE" 131072
+  fi
 
   if (( elapsed > SELF_MAX_SAMPLE_SECONDS )); then
     log_message "sample-slow elapsed=${elapsed}s"
@@ -1630,37 +1647,6 @@ trim_file_to_bytes() {
   mv -f -- "$temp" "$file"
 }
 
-trim_summary_to_bytes() {
-  local bytes="$1" temp body
-  [[ -f "$SUMMARY_FILE" ]] || return
-  temp="${SUMMARY_FILE}.trim.$$"
-  body="${SUMMARY_FILE}.body.$$"
-  tail -c "$bytes" "$SUMMARY_FILE" >| "$body" 2>/dev/null || return
-  # tail -c can begin in the middle of a TSV row; discard that partial row.
-  sed '1d' "$body" >| "$temp"
-  {
-    summary_header
-    cat "$temp"
-  } >| "$body"
-  mv -f -- "$body" "$SUMMARY_FILE"
-  rm -f -- "$temp"
-}
-
-trim_network_events_to_bytes() {
-  local bytes="$1" temp body
-  [[ -f "$NETWORK_EVENTS_FILE" ]] || return
-  temp="${NETWORK_EVENTS_FILE}.trim.$$"
-  body="${NETWORK_EVENTS_FILE}.body.$$"
-  tail -c "$bytes" "$NETWORK_EVENTS_FILE" >| "$body" 2>/dev/null || return
-  sed '1d' "$body" >| "$temp"
-  {
-    network_events_header
-    cat "$temp"
-  } >| "$body"
-  mv -f -- "$body" "$NETWORK_EVENTS_FILE"
-  rm -f -- "$temp"
-}
-
 safe_delete_directory() {
   local target="$1"
   [[ -n "$target" && "$target" == "$INCIDENTS_DIR"/* && -d "$target" ]] || return 1
@@ -1671,43 +1657,40 @@ directory_kb() {
   du -sk "$1" 2>/dev/null | awk '{print $1+0}'
 }
 
-rotate_legacy_summaries() {
-  local total_bytes oldest
-
-  [[ "$SUMMARY_LEGACY_RETENTION_DAYS" == <-> ]] || SUMMARY_LEGACY_RETENTION_DAYS=30
-  [[ "$SUMMARY_LEGACY_SIZE_LIMIT_MB" == <-> ]] || SUMMARY_LEGACY_SIZE_LIMIT_MB=20
-
-  while IFS= read -r old; do
-    [[ -n "$old" && -f "$old" ]] && rm -f -- "$old"
-  done < <(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' \
-    -mtime "+${SUMMARY_LEGACY_RETENTION_DAYS}" -print 2>/dev/null)
-
-  total_bytes="$(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' \
-    -exec stat -f '%z' {} + 2>/dev/null | awk '{sum += $1} END {print sum+0}')"
-  [[ "$total_bytes" == <-> ]] || total_bytes=0
-  while (( total_bytes > SUMMARY_LEGACY_SIZE_LIMIT_MB * 1024 * 1024 )); do
-    oldest="$(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' -print 2>/dev/null | sort | head -n 1)"
-    [[ -n "$oldest" && -f "$oldest" ]] || break
+rotate_historical_summaries() {
+  local total_bytes oldest file
+  local -a history
+  history=("$DATA_DIR"/summary-legacy-*.tsv(N.) "$DATA_DIR"/summary.tsv(N.))
+  for file in "${history[@]}"; do
+    if [[ -f "$file" ]] && (( $(epoch_now) - $(stat -f '%m' "$file") > HISTORY_RETENTION_DAYS * 86400 )); then
+      rm -f -- "$file"
+    fi
+  done
+  history=("$DATA_DIR"/summary-legacy-*.tsv(N.) "$DATA_DIR"/summary.tsv(N.))
+  (( ${#history} > 0 )) || return 0
+  total_bytes="$(stat -f '%z' "${history[@]}" | awk '{sum += $1} END {print sum+0}')"
+  while (( total_bytes > HISTORY_SIZE_LIMIT_MB * 1024 * 1024 )); do
+    oldest="$(stat -f '%m %N' "${history[@]}" | sort -n | head -n 1 | cut -d' ' -f2-)"
+    [[ -f "$oldest" ]] || break
+    if (( ${#history} == 1 )); then
+      trim_tsv_to_bytes "$oldest" $(( HISTORY_SIZE_LIMIT_MB * 1024 * 1024 ))
+      break
+    fi
     rm -f -- "$oldest"
-    total_bytes="$(find "$DATA_DIR" -maxdepth 1 -type f -name 'summary-legacy-*.tsv' \
-      -exec stat -f '%z' {} + 2>/dev/null | awk '{sum += $1} END {print sum+0}')"
-    [[ "$total_bytes" == <-> ]] || total_bytes=0
+    history=("$DATA_DIR"/summary-legacy-*.tsv(N.) "$DATA_DIR"/summary.tsv(N.))
+    (( ${#history} > 0 )) || break
+    total_bytes="$(stat -f '%z' "${history[@]}" | awk '{sum += $1} END {print sum+0}')"
   done
 }
 
 rotate_storage() {
-  local summary_limit_bytes total_limit_kb incidents_limit_kb single_limit_bytes
+  local total_limit_kb incidents_limit_kb single_limit_bytes
   local dir file total oldest incidents_kb largest
-  summary_limit_bytes=$(( SUMMARY_SIZE_LIMIT_MB * 1024 * 1024 ))
   single_limit_bytes=$(( SINGLE_INCIDENT_SIZE_LIMIT_MB * 1024 * 1024 ))
   total_limit_kb=$(( TOTAL_SIZE_LIMIT_MB * 1024 ))
   incidents_limit_kb=$(( INCIDENTS_SIZE_LIMIT_MB * 1024 ))
 
-  rotate_legacy_summaries
-
-  if [[ -f "$SUMMARY_FILE" ]] && (( $(stat -f '%z' "$SUMMARY_FILE" 2>/dev/null || print 0) > summary_limit_bytes )); then
-    trim_summary_to_bytes $(( summary_limit_bytes * 3 / 4 ))
-  fi
+  rotate_historical_summaries
   if [[ -f "$SERVICE_LOG" ]] && (( $(stat -f '%z' "$SERVICE_LOG" 2>/dev/null || print 0) > 10485760 )); then
     trim_file_to_bytes "$SERVICE_LOG" 5242880
   fi
@@ -1718,11 +1701,10 @@ rotate_storage() {
   done
   if [[ -f "$NETWORK_EVENTS_FILE" ]]; then
     local event_cutoff="$(date -v-"${RETENTION_DAYS}"d '+%Y-%m-%dT%H:%M:%S%z')"
-    awk -F '\t' -v cutoff="$event_cutoff" 'NR==1 || $1 >= cutoff' "$NETWORK_EVENTS_FILE" >| "$NETWORK_EVENTS_FILE.trim.$$"
-    mv -f -- "$NETWORK_EVENTS_FILE.trim.$$" "$NETWORK_EVENTS_FILE"
+    prune_recent_tsv "$NETWORK_EVENTS_FILE" "$event_cutoff"
   fi
   if [[ -f "$NETWORK_EVENTS_FILE" ]] && (( $(stat -f '%z' "$NETWORK_EVENTS_FILE" 2>/dev/null || print 0) > 5242880 )); then
-    trim_network_events_to_bytes 3145728
+    trim_tsv_to_bytes "$NETWORK_EVENTS_FILE" 5242880
   fi
 
   while IFS= read -r dir; do
@@ -1758,7 +1740,6 @@ rotate_storage() {
     if [[ -n "$oldest" ]]; then
       safe_delete_directory "$oldest"
     else
-      trim_summary_to_bytes 10485760
       trim_file_to_bytes "$SERVICE_LOG" 2097152
       break
     fi
@@ -1987,7 +1968,7 @@ capture_recent_system_logs_if_relevant() {
   [[ -f "$incident_dir/network-path-probe.txt" ]] && trigger_reason+=",internet-down"
 
   case ",$trigger_reason," in
-    *",manual-test,"*|*",monitor-sample-stall,"*|*",memory-pressure,"*|*",compressor-high,"*|*",crashreporter-high,"*|*",coresymbolication-high,"*|*",webkit-cpu-high,"*|*",mediaanalysisd-high,"*|*",mobileassetd-high,"*|*",replayd-high,"*|*",system-load-high,"*)
+    *",manual-test,"*|*",monitor-sample-stall,"*|*",memory-pressure,"*|*",os-memory-pressure-critical,"*|*",compressor-high,"*|*",crashreporter-high,"*|*",coresymbolication-high,"*|*",webkit-cpu-high,"*|*",mediaanalysisd-high,"*|*",mobileassetd-high,"*|*",replayd-high,"*|*",system-load-high,"*)
       capture_recent_system_logs "$incident_dir" "$incident_start_epoch" "$incident_end_epoch"
       ;;
     *",internet-down,"*)
@@ -2398,6 +2379,8 @@ NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
 generate_reboot_postmortem() {
   local marker="$STATE_DIR/postmortem-boot-epoch" output="$DATA_DIR/last-reboot-diagnosis.txt"
   local boot_epoch boot_text last_line last_ts last_epoch rows metrics
+  local SUMMARY_FILE="$SUMMARY_FILE"
+  [[ -s "$SUMMARY_FILE" ]] || SUMMARY_FILE="$HISTORICAL_SUMMARY_FILE"
   local min_free max_compressor max_swap max_safari max_webkit_proc max_ws max_webkit_cpu hot_pid
   local safari_drop compressor_drop swap_drop drop_time report_line report mtime command pid cpu footprint stack_hint
   local report_found=0 webkit_report_found=0 confidence="low" classification="unresolved" action
@@ -2427,26 +2410,27 @@ generate_reboot_postmortem() {
   ' "$SUMMARY_FILE" 2>/dev/null)"
 
   metrics="$({ head -n 1 "$SUMMARY_FILE"; print -r -- "$rows"; } | awk -F '\t' '
-    BEGIN {minfree=101; prevSafari=-1}
-NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
+    NR == 1 {columns=NF; for (i=1;i<=NF;i++) col[$i]=i; next}
     function value(name) {return col[name] ? $(col[name]) : ""}
-    NF == columns && value("memory_pressure_free_pct") ~ /^[0-9]+(\.[0-9]+)?$/ {
-      if ((value("memory_pressure_free_pct")+0) < minfree) minfree=value("memory_pressure_free_pct")+0
-      if ((value("compressor_physical_mb")+0) > comp) comp=value("compressor_physical_mb")+0
-      if ((value("swap_used_mb")+0) > swap) swap=value("swap_used_mb")+0
-      if ((value("safari_and_all_webkit_group_mb")+0) > safari) safari=value("safari_and_all_webkit_group_mb")+0
-      if ((value("webkit_max_mb")+0) > webproc) webproc=value("webkit_max_mb")+0
-      if ((value("windowserver_cpu_pct")+0) > ws) ws=value("windowserver_cpu_pct")+0
-      if ((value("webkit_hot_cpu_pct")+0) > whot) {whot=value("webkit_hot_cpu_pct")+0; hotpid=value("webkit_hot_pid")+0}
-      if (prevSafari >= 0) {
-        sd=prevSafari-(value("safari_and_all_webkit_group_mb")+0); cd=prevComp-(value("compressor_physical_mb")+0); swd=prevSwap-(value("swap_used_mb")+0)
-        if (sd > maxsd) {maxsd=sd; maxcd=cd; maxswd=swd; droptime=value("timestamp")}
+    function numeric(v) {return v ~ /^[0-9]+(\.[0-9]+)?$/}
+    function maximum(name,k, v) {v=value(name); if(numeric(v) && (!(k in maxima) || v+0>maxima[k])) maxima[k]=v+0}
+    function out(k) {return k in maxima ? maxima[k] : "unknown"}
+    NF == columns {
+      f=value("memory_pressure_free_pct"); if(numeric(f) && (!havefree || f+0<minfree)){minfree=f+0;havefree=1}
+      maximum("compressor_physical_mb","comp"); maximum("swap_used_mb","swap")
+      maximum("safari_and_all_webkit_group_mb","safari"); maximum("webkit_max_mb","webproc")
+      maximum("windowserver_cpu_pct","ws")
+      w=value("webkit_hot_cpu_pct"); if(numeric(w) && (!("whot" in maxima) || w+0>maxima["whot"])) {maxima["whot"]=w+0;hotpid=value("webkit_hot_pid")}
+      sv=value("safari_and_all_webkit_group_mb"); cv=value("compressor_physical_mb"); sw=value("swap_used_mb")
+      if(numeric(prevSafari)&&numeric(sv)) {
+        sd=prevSafari-sv
+        if(!havedrop||sd>maxsd){havedrop=1;maxsd=sd;maxcd=(numeric(prevComp)&&numeric(cv)?prevComp-cv:"unknown");maxswd=(numeric(prevSwap)&&numeric(sw)?prevSwap-sw:"unknown");droptime=value("timestamp")}
       }
-      prevSafari=value("safari_and_all_webkit_group_mb")+0; prevComp=value("compressor_physical_mb")+0; prevSwap=value("swap_used_mb")+0
+      prevSafari=sv;prevComp=cv;prevSwap=sw
     }
-    END {printf "%.0f %.1f %.1f %.1f %.1f %.1f %.1f %d %.1f %.1f %.1f %s\n",minfree,comp,swap,safari,webproc,ws,whot,hotpid,maxsd,maxcd,maxswd,droptime}
+    END {printf "%s %s %s %s %s %s %s %s %s %s %s %s\n",(havefree?minfree:"unknown"),out("comp"),out("swap"),out("safari"),out("webproc"),out("ws"),out("whot"),(hotpid!=""?hotpid:"unknown"),(havedrop?maxsd:"unknown"),(havedrop?maxcd:"unknown"),(havedrop?maxswd:"unknown"),(droptime!=""?droptime:"-")}
   ')"
-  read -r min_free max_compressor max_swap max_safari max_webkit_proc max_ws max_webkit_cpu hot_pid safari_drop compressor_drop swap_drop drop_time <<< "${metrics:-101 0 0 0 0 0 0 0 0 0 0 -}"
+  read -r min_free max_compressor max_swap max_safari max_webkit_proc max_ws max_webkit_cpu hot_pid safari_drop compressor_drop swap_drop drop_time <<< "${metrics:-unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown -}"
 
   ranked=("${(@f)$(find "$DIAGNOSTIC_REPORTS_DIR" "$SYSTEM_DIAGNOSTIC_REPORTS_DIR" -maxdepth 1 -type f -name '*.cpu_resource.diag' -print0 2>/dev/null \
     | xargs -0 stat -f $'%m\t%N' 2>/dev/null | sort -rn 2>/dev/null)}")
@@ -2544,7 +2528,7 @@ finalize_incident() {
 }
 
 run_incident_capture() {
-  local reason="$1" start end now incident_id incident_file base_lines sample_started remaining
+  local reason="$1" start end now incident_id incident_file sample_started remaining recovered=0
   local webkit_sample_count=0 webkit_last_sample_epoch=0
   start="$(epoch_now)"
   end=$(( start + INCIDENT_DURATION_SECONDS ))
@@ -2554,11 +2538,7 @@ run_incident_capture() {
   incident_file="$CURRENT_INCIDENT_DIR/timeline.tsv"
   summary_header >| "$incident_file"
   ensure_summary_header
-  base_lines=$(( PRE_TRIGGER_MINUTES * 60 / AC_INTERVAL_SECONDS + 20 ))
-  {
-    head -n 1 "$SUMMARY_FILE"
-    tail -n "$base_lines" "$SUMMARY_FILE"
-  } >| "$CURRENT_INCIDENT_DIR/summary-before-trigger.tsv" 2>/dev/null || true
+  cp "$SUMMARY_FILE" "$CURRENT_INCIDENT_DIR/summary-before-trigger.tsv"
   copy_recent_tsv_rows "$PROCESS_CONTEXT_FILE" "$CURRENT_INCIDENT_DIR/process-context-before-trigger.tsv" "$PROCESS_CONTEXT_PRE_TRIGGER_ROWS"
   copy_recent_tsv_rows "$SAFARI_LIFECYCLE_FILE" "$CURRENT_INCIDENT_DIR/safari-lifecycle-before-trigger.tsv" "$PROCESS_CONTEXT_PRE_TRIGGER_ROWS"
 
@@ -2601,6 +2581,17 @@ run_incident_capture() {
         (( webkit_sample_count-- ))
       fi
     fi
+    # End a resolved capture early; explicit manual-test keeps its requested duration.
+    if [[ "$reason" != *manual-test* && -z "${TRIGGER_FLAGS:-}" && "${PROCESS_SNAPSHOT_STATUS:-}" == ok && ! -f "$STATE_DIR/network-pending-incident" ]] && is_number "${MEMORY_FREE_PERCENT:-unknown}" && is_number "${COMPRESSOR_MB:-unknown}"; then
+      (( recovered++ ))
+      if (( recovered >= PERFORMANCE_EPISODE_RECOVERY_SAMPLES )); then
+        print -r -- "capture_end_reason=recovered" >> "$CURRENT_INCIDENT_DIR/metadata.txt"
+        rm -f -- "$STATE_DIR"/episode-{performance,crash}.{active,recovery} "$STATE_DIR/episode-memory.active"
+        break
+      fi
+    else
+      recovered=0
+    fi
     remaining=$(( INCIDENT_INTERVAL_SECONDS - ($(epoch_now) - sample_started) ))
     (( remaining > 0 )) && interruptible_sleep "$remaining"
   done
@@ -2625,7 +2616,7 @@ update_episode_state() {
   local recovery_file="$STATE_DIR/episode-${group}.recovery" count=0
   if [[ -f "$active_file" ]]; then
     if (( anomaly_present == 1 )); then
-      print -r -- "0" >| "$recovery_file"
+      [[ ! -f "$recovery_file" || "$(<"$recovery_file")" == 0 ]] || print -r -- "0" >| "$recovery_file"
       print -r -- "1"
     else
       [[ -f "$recovery_file" ]] && count="$(<"$recovery_file")"
@@ -2652,15 +2643,19 @@ mark_episode_active() {
 }
 
 handle_trigger_state() {
-  local flags="$1" count=0 performance_present=0 crash_present=0
+  local flags="$1" count=0 previous_count=0 performance_present=0 crash_present=0 memory_event=0
   local performance_active crash_active flag candidate_flags
   local -a raw_flags candidates
   [[ -f "$STATE_DIR/trigger.count" ]] && count="$(<"$STATE_DIR/trigger.count")"
   [[ "$count" == <-> ]] || count=0
+  previous_count=$count
 
   raw_flags=("${(@s:,:)flags}")
   for flag in "${raw_flags[@]}"; do
     case "$flag" in
+      os-memory-pressure-critical)
+        memory_event=1
+        ;;
       memory-pressure|compressor-high|safari-high|webkit-process-high|webkit-cpu-high|windowserver-high|mediaanalysisd-high|mobileassetd-high|replayd-high|system-load-high|monitor-sample-stall)
         performance_present=1
         ;;
@@ -2681,6 +2676,9 @@ handle_trigger_state() {
       crashreporter-high|coresymbolication-high)
         (( crash_active == 0 )) && candidates+=("$flag")
         ;;
+      os-memory-pressure-critical)
+        [[ ! -f "$STATE_DIR/episode-memory.active" ]] && candidates+=("$flag")
+        ;;
       memory-pressure|compressor-high|safari-high|webkit-process-high|webkit-cpu-high|windowserver-high|mediaanalysisd-high|mobileassetd-high|replayd-high|system-load-high)
         (( performance_active == 0 )) && candidates+=("$flag")
         ;;
@@ -2689,7 +2687,7 @@ handle_trigger_state() {
   candidate_flags="${(j:,:)candidates}"
 
   if [[ -n "$candidate_flags" ]]; then
-    if [[ "$candidate_flags" == *"manual-test"* || "$candidate_flags" == *"internet-down"* || "$candidate_flags" == *"monitor-sample-stall"* || \
+    if [[ "$candidate_flags" == *"os-memory-pressure-critical"* || "$candidate_flags" == *"manual-test"* || "$candidate_flags" == *"internet-down"* || "$candidate_flags" == *"monitor-sample-stall"* || \
       "$candidate_flags" == *"crashreporter-high"* || "$candidate_flags" == *"coresymbolication-high"* ]]; then
       count="$CONSECUTIVE_TRIGGER_SAMPLES"
     else
@@ -2698,22 +2696,30 @@ handle_trigger_state() {
   else
     count=0
   fi
-  print -r -- "$count" >| "$STATE_DIR/trigger.count"
+  (( count == previous_count )) || print -r -- "$count" >| "$STATE_DIR/trigger.count"
 
   if (( count >= CONSECUTIVE_TRIGGER_SAMPLES )); then
-    (( performance_present == 1 && performance_active == 0 )) && mark_episode_active performance
+    if (( memory_event == 1 )); then
+      print -r -- "$(timestamp)" >| "$STATE_DIR/episode-memory.active"
+    fi
+    (( (performance_present == 1 || memory_event == 1) && performance_active == 0 )) && mark_episode_active performance
     (( crash_present == 1 && crash_active == 0 )) && mark_episode_active crash
     run_incident_capture "$candidate_flags"
   fi
 }
 
 run_once() {
-  local power interval
-  power="$(current_power_mode)"
-  interval="$(choose_interval "$power")"
-  collect_and_write_snapshot "$interval" "" "$power"
-  maybe_rotate_storage
-  print -r -- "snapshot=$(timestamp) flags=${CONTEXT_FLAGS:-none} incident_flags=${TRIGGER_FLAGS:-none}"
+  local scratch
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/maclagmonitor-snapshot.XXXXXX")" || return 1
+  local STATE_DIR="$scratch/state" DATA_DIR="$scratch"
+  local SUMMARY_FILE="$scratch/timeline.tsv" PROCESS_CONTEXT_FILE="$scratch/process-context.tsv"
+  local SAFARI_LIFECYCLE_FILE="$scratch/safari-lifecycle.tsv" SAFARI_LIFECYCLE_STATE="$STATE_DIR/safari-lifecycle.state"
+  local INTERNET_PROBE_CACHE_FILE="$STATE_DIR/internet-probe.tsv" NETWORK_EVENTS_FILE="$scratch/network-events.tsv"
+  local SERVICE_LOG="$scratch/service.log" CURRENT_INCIDENT_DIR=""
+  mkdir -p "$STATE_DIR"
+  collect_and_write_snapshot 0 "$SUMMARY_FILE"
+  cat "$SUMMARY_FILE"
+  rm -rf -- "$scratch"
 }
 
 run_diagnostic() {
@@ -2731,7 +2737,7 @@ run_diagnostic() {
   local INTERNET_PROBE_CACHE_FILE="$STATE_DIR/internet-probe.tsv"
   local NETWORK_EVENTS_FILE="$diagnostic_dir/network-events.tsv"
   mkdir -p "$STATE_DIR"
-  copy_recent_tsv_rows "$DATA_DIR/summary.tsv" "$diagnostic_dir/summary-before-trigger.tsv" "$REBOOT_POSTMORTEM_ROWS"
+  copy_recent_tsv_rows "$INSTALL_ROOT/state/recent-detection.tsv" "$diagnostic_dir/summary-before-trigger.tsv" "$REBOOT_POSTMORTEM_ROWS"
   copy_recent_tsv_rows "$DATA_DIR/process-context.tsv" "$diagnostic_dir/process-context-before-trigger.tsv" "$PROCESS_CONTEXT_PRE_TRIGGER_ROWS"
   {
     print -r -- "started=$(timestamp)"
@@ -2739,13 +2745,12 @@ run_diagnostic() {
     print -r -- "monitor_version=$(<"$INSTALL_ROOT/VERSION")"
     print -r -- "scope=one-shot; fresh HTTPS probe; no settings changed; post-recovery evidence cannot prove the earlier cause"
   } >| "$diagnostic_dir/metadata.txt"
-  collect_and_write_snapshot 0
+  collect_and_write_snapshot 0 "$SUMMARY_FILE"
   capture_detailed_state "$diagnostic_dir" current
   capture_network_path_diagnostics "$diagnostic_dir"
   capture_recent_system_logs "$diagnostic_dir" "$started" "$(epoch_now)"
   finalize_incident "$diagnostic_dir" manual-diagnostic || true
   rm -rf -- "$STATE_DIR"
-  rm -f -- "$PROCESS_CONTEXT_FILE"
   print -r -- "$diagnostic_dir"
 }
 
@@ -2753,6 +2758,7 @@ main_loop() {
   local power interval free_disk
   print -r -- "$$" >| "$PID_FILE"
   OWNS_PID_FILE=1
+  cleanup_stale_runtime_temp_files
   mark_latest_incomplete_incident
   generate_reboot_postmortem
   capture_armed_network_reboot_reference
@@ -2771,7 +2777,7 @@ main_loop() {
     capture_pending_network_recovery
     handle_trigger_state "$TRIGGER_FLAGS"
     maybe_rotate_storage
-    interruptible_sleep "$interval"
+    wait_for_detection "$interval"
   done
 }
 
@@ -2782,18 +2788,12 @@ case "${1:-run}" in
   --once)
     run_once
     ;;
-  --force-incident)
-    FORCE_TRIGGER=1
-    run_once
-    run_incident_capture "manual-test"
-    ;;
   --network-diagnostic)
     capture_network_reference manual "$(boot_epoch)" "$DATA_DIR/network-current.txt" || exit 1
     print -r -- "$DATA_DIR/network-current.txt"
     ;;
   --diagnose)
     run_diagnostic
-    maybe_rotate_storage 1
     ;;
   --prepare-network-reboot)
     reference_boot="$(boot_epoch)"
@@ -2803,7 +2803,7 @@ case "${1:-run}" in
     print -r -- "Network reference saved; one comparison will be captured after the next boot."
     ;;
   *)
-    print -u2 -- "Usage: $0 [run|--once|--diagnose|--force-incident|--network-diagnostic|--prepare-network-reboot]"
+    print -u2 -- "Usage: $0 [run|--once|--diagnose|--network-diagnostic|--prepare-network-reboot]"
     exit 2
     ;;
 esac

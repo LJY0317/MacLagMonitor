@@ -19,4 +19,9 @@
 /bin/*
 !/bin/mac-lag-monitor.sh
 !/bin/mac-lag-monitorctl.sh
+!/bin/maclagmonitor-native.swift
 !/bin/check-public-tree.sh
+
+!/tests/
+/tests/*
+!/tests/verify-query.py

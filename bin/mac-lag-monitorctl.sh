@@ -15,31 +15,57 @@ fi
 LABEL="${MLM_LAUNCHD_LABEL:-${LAUNCHD_LABEL:-com.maclagmonitor.agent}}"
 PLIST_PATH="${MLM_LAUNCH_AGENT_PATH:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 MONITOR="$INSTALL_ROOT/bin/mac-lag-monitor.sh"
+NATIVE="$INSTALL_ROOT/bin/maclagmonitor-native"
 
 usage() {
-  print -r -- "MacLagMonitor control"
-  print -r -- "Usage: $0 {status|snapshot|diagnose|network|prepare-reboot|test-trigger|start|stop|restart|logs|uninstall}"
+  cat <<'HELP'
+MacLagMonitor
+Usage: maclagmonitor <command> [options]
+
+Read-only:
+  status [--json]             Installed version, process, settings, recent detection
+  sources [--last 7d] [--json]
+  query <power|battery|sleep|cpu|memory|network|incidents|timeline|history|logs|reports>
+        [--last 24h | --from ISO8601 --to ISO8601]
+        [--group-by hour|day] [--limit N] [--json]
+  version                     Installed version
+  help                        This help
+
+Explicit collection/control:
+  snapshot                    Fresh one-shot TSV; no change to live capture state
+  diagnose                   Save a one-shot incident
+  network                    Save a fresh network diagnostic
+  prepare-reboot             Request a before/after network comparison
+  test-trigger               Request an explicit incident capture
+  start | stop | restart | logs | uninstall
+HELP
 }
 
 is_running() {
   [[ -f "$PID_FILE" ]] || return 1
   local pid="$(<"$PID_FILE")"
-  [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null
+  [[ "$pid" == <-> && "$pid" != 0 ]] && [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *"$MONITOR"* ]]
 }
 
 case "${1:-}" in
+  help|-h|--help|'')
+    usage
+    ;;
+  version|--version)
+    cat "$INSTALL_ROOT/VERSION"
+    ;;
   status)
-    if is_running; then
-      print -r -- "MacLagMonitor is running (PID $(<"$PID_FILE"))."
-    else
-      print -r -- "MacLagMonitor is not running."
-    fi
-    [[ -f "$DATA_DIR/summary.tsv" ]] && tail -n 2 "$DATA_DIR/summary.tsv"
-    if [[ -f "$DATA_DIR/network-events.tsv" ]]; then
-      print -r -- "Recent internet transitions:"
-      tail -n 4 "$DATA_DIR/network-events.tsv"
-    fi
-    print -r -- "Installed data size: $(du -sh "$INSTALL_ROOT" 2>/dev/null | awk '{print $1}')"
+    shift
+    exec "$NATIVE" status "$INSTALL_ROOT" "$@"
+    ;;
+  sources)
+    shift
+    exec "$NATIVE" query "$INSTALL_ROOT" sources "$@"
+    ;;
+  query)
+    shift
+    [[ "${1:-}" != --help && "${1:-}" != -h ]] || { usage; exit 0; }
+    exec "$NATIVE" query "$INSTALL_ROOT" "$@"
     ;;
   snapshot)
     "$MONITOR" --once
@@ -65,22 +91,23 @@ case "${1:-}" in
     fi
     ;;
   start)
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || \
-      launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    sleep 1
+    if ! is_running; then
+      launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null ||
+        launchctl kickstart "gui/$(id -u)/$LABEL" || exit 1
+    fi
     "$0" status
     ;;
   stop)
-    launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
-    if is_running; then
-      kill -TERM "$(<"$PID_FILE")" 2>/dev/null || true
-    fi
+    launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || {
+      if is_running; then
+        print -u2 -- "Unable to stop the LaunchAgent."
+        exit 1
+      fi
+    }
     print -r -- "MacLagMonitor stopped."
     ;;
   restart)
-    "$0" stop
-    sleep 1
-    "$0" start
+    "$0" stop && "$0" start
     ;;
   logs)
     print -r -- "$DATA_DIR"
