@@ -28,6 +28,7 @@ Read-only:
   query <power|battery|sleep|cpu|memory|network|incidents|timeline|history|logs|reports>
         [--last 24h | --from ISO8601 --to ISO8601]
         [--group-by hour|day] [--limit N] [--json]
+        [--events]            With sleep only: show retained macOS wake, display and unlock events
   version                     Installed version
   help                        This help
 

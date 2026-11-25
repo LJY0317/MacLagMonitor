@@ -72,14 +72,17 @@ struct Range {
 }
 struct Options {
     let topic: String; let range: Range; let group: String?; let limit: Int; let json: Bool
+    let events: Bool
     init(_ arguments: [String], now: Double = Date().timeIntervalSince1970) throws {
         guard let topic = arguments.first else { throw QueryError("query requires a topic; see help") }
         self.topic = topic
         var start: Double?, end: Double?, duration: Double?, group: String?, limit: Int?, json = false
+        var events = false
         var i = 1
         while i < arguments.count {
             let key = arguments[i]; i += 1
             if key == "--json" { json = true; continue }
+            if key == "--events" { events = true; continue }
             guard i < arguments.count else { throw QueryError("missing value for " + key) }
             let v = arguments[i]; i += 1
             switch key {
@@ -98,7 +101,9 @@ struct Options {
         let b = end ?? now, a = start ?? (b - (duration ?? (topic == "sources" ? 604800 : 86400)))
         guard a.isFinite, b.isFinite, a < b else { throw QueryError("invalid time range") }
         if group != nil && !["power","sleep","timeline"].contains(topic) { throw QueryError("--group-by is supported for power, sleep, timeline") }
+        if events && topic != "sleep" { throw QueryError("--events is supported for sleep") }
         self.range = Range(start:a,end:b); self.group = group; self.limit = limit ?? (group == nil ? 20 : 100); self.json = json
+        self.events = events
     }
 }
 final class Database {
@@ -515,31 +520,130 @@ func reportsResult(_ o:Options)->Row {
     results.sort{str($0["modified_at"])>str($1["modified_at"])}
     return ["status":"ok","source":"macos.DiagnosticReports","count":results.count,"reports":Array(results.prefix(o.limit)),"notes":["File modification time is not guaranteed to be the event time. Reports are referenced, not copied."]]
 }
-func logsResult(_ o:Options)throws->Row {
-    // Query only on explicit request. Aggregate by process and level without log bodies.
-    let f=DateFormatter();f.locale=Locale(identifier:"en_US_POSIX");f.dateFormat="yyyy-MM-dd HH:mm:ss"
+func readUnifiedLog(_ range: Range, predicate: String, visit: (Row) -> Void) throws -> Int32 {
     let p=Process(),pipe=Pipe()
     p.executableURL=URL(fileURLWithPath:"/usr/bin/log")
-    p.arguments=["show","--start",f.string(from:Date(timeIntervalSince1970:o.range.start)),"--end",f.string(from:Date(timeIntervalSince1970:o.range.end)),
-                 "--style","ndjson","--predicate","(messageType == error OR messageType == fault) AND (process == \"kernel\" OR process == \"airportd\" OR process == \"configd\" OR process == \"mDNSResponder\" OR process == \"nesessionmanager\" OR process == \"neagent\" OR process == \"nehelper\" OR process == \"ReportCrash\" OR process == \"WindowServer\" OR process == \"powerd\")"]
+    p.arguments=["show","--start","@\(String(format:"%.0f",floor(range.start)))","--end","@\(String(format:"%.0f",floor(range.end)))",
+                 "--style","ndjson","--predicate",predicate]
     p.standardOutput=pipe;p.standardError=FileHandle.nullDevice
     try p.run()
-    var counts:[String:Int]=[:],pending=Data()
+    var pending=Data()
     while true {
         let d=pipe.fileHandleForReading.availableData;if d.isEmpty{break};pending.append(d)
         while let index=pending.firstIndex(of:10) {
             let line=pending.prefix(upTo:index);pending.removeSubrange(...index)
             if let row=(try? JSONSerialization.jsonObject(with:line)) as? Row {
-                let name=URL(fileURLWithPath:str(row["processImagePath"])).lastPathComponent
-                guard !name.isEmpty else{continue}
-                counts[name+" / "+str(row["messageType"]),default:0]+=1
+                visit(row)
             }
         }
     }
     p.waitUntilExit()
-    return ["status":p.terminationStatus==0 ? "ok":"partial","source":"macos.UnifiedLog","exit_status":p.terminationStatus,
+    return p.terminationStatus
+}
+func logsResult(_ o:Options)throws->Row {
+    var counts:[String:Int]=[:]
+    let predicate = #"(messageType == error OR messageType == fault) AND (process == "kernel" OR process == "airportd" OR process == "configd" OR process == "mDNSResponder" OR process == "nesessionmanager" OR process == "neagent" OR process == "nehelper" OR process == "ReportCrash" OR process == "WindowServer" OR process == "powerd")"#
+    let exitStatus = try readUnifiedLog(o.range, predicate: predicate) { row in
+        let name=URL(fileURLWithPath:str(row["processImagePath"])).lastPathComponent
+        guard !name.isEmpty else{return}
+        counts[name+" / "+str(row["messageType"]),default:0]+=1
+    }
+    return ["status":exitStatus==0 ? "ok":"partial","source":"macos.UnifiedLog","exit_status":exitStatus,
             "categories":counts.sorted{$0.value>$1.value}.prefix(o.limit).map{["category":$0.key,"records":$0.value] as Row},
             "notes":["Filtered error/fault records only; retained log messages are not independent fault counts. No raw messages stored or returned."]]
+}
+
+func sleepEventsResult(_ o: Options) -> Row {
+    let predicate = #"""
+        (process == "powerd" AND category == "sleepWake" AND
+          (eventMessage BEGINSWITH "Entering Sleep state" OR eventMessage BEGINSWITH "DarkWake from"
+           OR eventMessage BEGINSWITH "Wake from" OR eventMessage BEGINSWITH "DarkWake to FullWake"))
+        OR (process == "WindowServer" AND category == "display" AND
+          (eventMessage CONTAINS "Broadcast: Did Wake" OR eventMessage CONTAINS "Broadcast: Did Sleep"))
+        OR (process == "bluetoothd" AND
+          (eventMessage BEGINSWITH "AP wakeup by LE Data" OR eventMessage BEGINSWITH "Power source updated CBPowerSource Nm '"))
+        OR (process == "loginwindow" AND
+          (eventMessage CONTAINS "sendNotificationOf kScreenIsUnlocked" OR eventMessage CONTAINS "APEventContinuityUnlocked"))
+        """#
+    let timestamp = DateFormatter()
+    timestamp.locale = Locale(identifier: "en_US_POSIX")
+    timestamp.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+    var deviceNames: [UUID: Set<String>] = [:]
+    var events: [(time: Double, event: Row, device: UUID?)] = []
+    var invalidTimestamps = 0
+
+    func field(_ message: String, after prefix: String, before suffix: String) -> String? {
+        guard let start = message.range(of: prefix)?.upperBound else { return nil }
+        let tail = message[start...]
+        guard let end = tail.range(of: suffix)?.lowerBound else { return nil }
+        let value = String(tail[..<end]).trimmingCharacters(in: .whitespaces)
+        return value.isEmpty || value == "<private>" ? nil : value
+    }
+
+    let queryRange = Range(start: o.range.start, end: ceil(o.range.end))
+    let exitStatus = try? readUnifiedLog(queryRange, predicate: predicate) { row in
+        let message = str(row["eventMessage"])
+        guard !message.isEmpty else { return }
+        let rawTime = str(row["timestamp"])
+        guard let dot = rawTime.firstIndex(of: ".") else { invalidTimestamps += 1; return }
+        let fraction = rawTime[rawTime.index(after: dot)...].prefix(while: \.isNumber)
+        let zone = rawTime[rawTime.index(dot, offsetBy: fraction.count + 1)...]
+        guard let seconds = timestamp.date(from: "\(rawTime[..<dot]) \(zone)"),
+              let fractionSeconds = Double("0.\(fraction)") else { invalidTimestamps += 1; return }
+        let observed = seconds.timeIntervalSince1970 + fractionSeconds
+        guard observed >= o.range.start && observed <= o.range.end else { return }
+
+        let process = URL(fileURLWithPath: str(row["processImagePath"])).lastPathComponent
+        var event: Row = ["timestamp": stamp(observed), "process": process]
+        var device: UUID?
+        switch process {
+        case "powerd":
+            let kind: String
+            if message.hasPrefix("Entering Sleep state") { kind = "sleep" }
+            else if message.hasPrefix("DarkWake from") { kind = "dark_wake" }
+            else { kind = "full_wake" }
+            event["kind"] = kind
+            let reason = message.range(of: "due to ").map {
+                message[$0.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "'").union(.whitespaces))
+            }
+            event["reason"] = reason.flatMap { $0.isEmpty || $0 == "<private>" ? nil : $0 } as Any? ?? null
+        case "WindowServer":
+            event["kind"] = message.contains("Broadcast: Did Wake") ? "display_on" : "display_off"
+        case "loginwindow":
+            event["kind"] = message.contains("APEventContinuityUnlocked") ? "continuity_unlock" : "screen_unlocked"
+        case "bluetoothd":
+            if message.hasPrefix("Power source updated") {
+                if let id = field(message, after: "AcID ", before: ",").flatMap(UUID.init(uuidString:)),
+                   let name = field(message, after: "CBPowerSource Nm '", before: "', SID ") {
+                    deviceNames[id, default: []].insert(name)
+                }
+                return
+            }
+            event["kind"] = "bluetooth_wake"
+            event["reason"] = "Bluetooth LE data"
+            event["device_name"] = field(message, after: "deviceName=", before: ",") as Any? ?? null
+            device = field(message, after: "uuid=", before: ",").flatMap(UUID.init(uuidString:))
+        default:
+            return
+        }
+        events.append((observed, event, device))
+    }
+
+    events.sort { $0.time < $1.time }
+    let selected = events.suffix(o.limit).map { record -> Row in
+        var event = record.event
+        if event["device_name"] is NSNull, let device = record.device,
+           let names = deviceNames[device], names.count == 1 {
+            event["device_name"] = names.first
+        }
+        return event
+    }
+    let status = exitStatus == 0 ? (invalidTimestamps == 0 ? "ok" : "partial") : (events.isEmpty ? "unavailable" : "partial")
+    return ["status": status, "source": "macos.UnifiedLog", "exit_status": exitStatus as Any? ?? null,
+            "event_count": events.count, "events": selected,
+            "notes": ["Retained matching OS records only. An empty result does not establish that no wake occurred.",
+                      "Display changes, system wakes and unlocks are separate observations.",
+                      "Bluetooth names are shown only when present or matched by device ID in the selected records."]]
 }
 func historicalResult(_ root:URL,_ o:Options)->Row {
     let data=root.appendingPathComponent("data")
@@ -596,7 +700,9 @@ func runQuery(_ root:URL,_ args:[String]) throws {
                     "notes":["Availability is based on the selected archive files; private schemas may change. Unified Log and DiagnosticReports are queried separately."]]
         case "power":result=powerResult(log,o)
         case "battery":result=batteryResult(log,o)
-        case "sleep":result=powerResult(log,o,true)
+        case "sleep":
+            result=powerResult(log,o,true)
+            if o.events { result["sleep_events"] = sleepEventsResult(o) }
         case "cpu":result=cpuResult(log,o)
         case "memory":result=memoryResult(log,o)
         case "network":result=networkResult(log,o,data)

@@ -41,6 +41,7 @@ maclagmonitor sources --last 7d --json
 maclagmonitor query power --last 24h --json
 maclagmonitor query power --last 7d --group-by day --json
 maclagmonitor query sleep --last 7d --json
+maclagmonitor query sleep --events --last 30m --json
 maclagmonitor query battery --last 24h --json
 maclagmonitor query cpu --last 24h --limit 10 --json
 maclagmonitor query memory --last 24h --json
@@ -60,6 +61,8 @@ maclagmonitor query history --last 24h --json
 | incidents / timeline | 자체 장애 요약, OS 자원 이력, 최근 감지 증거의 통합 조회 |
 | logs / reports | Unified Log의 관련 error/fault 집계 및 DiagnosticReports 파일 참조 |
 | history | 이전 버전의 동결된 요약과 최근 감지 버퍼; 새 누적 이력은 생성하지 않음 |
+
+`query sleep --events`는 PowerLog 구간에 더해 기존 Unified Log에서 잠자기, Dark Wake, Full Wake, 화면 켜짐·꺼짐과 잠금 해제를 시간순으로 표시합니다. `sleep_events`는 자체 조회 상태와 전체 일치 건수를 반환하며, `--limit`는 표시할 최신 이벤트 수를 제한합니다. 깨우기 사유와 블루투스 기기명은 기록에서 확인될 때 표시합니다. 이벤트가 없으면 로그가 보존되지 않았거나 해당 macOS 버전의 기록 형식이 다를 수 있습니다. 이 옵션은 요청 시에만 실행되며 읽은 기록은 저장하지 않습니다.
 
 공통 시간 옵션은 `--last 24h` 또는 `--from 2026-01-01T00:00:00+00:00 --to 2026-01-02T00:00:00+00:00`입니다. `power`, `sleep`, `timeline`은 `--group-by hour|day`를 지원합니다. `--limit N`은 세부 결과 수를 제한합니다. 날짜별 구간은 로컬 시간대를 사용하고 타임스탬프는 ISO 8601로 반환합니다. 기본 출력은 읽기 좋은 JSON, `--json`은 압축된 기계용 JSON입니다.
 
